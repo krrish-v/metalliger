@@ -7,4 +7,4 @@ torchvision==0.29.0
 # Hugging Face & VLM Support (Qwen3-VL)
 transformers==5.17.0
 qwen-vl-utils==0.0.14
-protobuf==4.25.9
+protobuf==5.29.6
