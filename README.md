@@ -1,6 +1,14 @@
 # Metalliger
 
 <p align="center">
+  <img
+    src="https://raw.githubusercontent.com/krrish-v/metalliger/main/readme_img/metalliger_logo%28generatedbyGemini%29.png"
+    alt="MetalLiger Logo"
+    width="200"
+  >
+</p>
+
+<p align="center">
   <strong>Ultra-Fast Native PyTorch LLM & VLM Inference on Apple Silicon</strong>
   <br />
   <em>Zero model conversion. Fused Metal kernels. Faster and Better accuracy.</em>
