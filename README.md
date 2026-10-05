@@ -31,7 +31,7 @@ Running LLMs and Vision-Language Models (VLMs) on Apple Silicon has traditionall
 
 ### % speedup (time reduction) of Metalliger over Hugging Face Transformers on 100 VQ Queries
 
-![MetalLiger Speedup](readme_img/metalliger_speedup_compact.png)
+![MetalLiger Speedup](readme_img/metalliger_speedup.png)
 
 Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` architecture model:
 
