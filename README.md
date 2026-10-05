@@ -43,17 +43,27 @@ Running LLMs and Vision-Language Models (VLMs) on Apple Silicon has traditionall
 
 Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` architecture model:
 
-| Inference type | Model data type | Average Accuracy | Average Tokens/sec |
-| :--- | :--- | :--- | :--- |
-| transformers | Float32 | Very High | 27.98 t/sec |
-| metalliger | Float32 | Better | 29.9 t/s |
-| transformers | bloat16 | Very High | 43.19 t/sec |
-| metalliger | bloat16 | Better | 48.5 t/s |
-| mlx-vlm | bloat16 | Average | 35.810 t/s |
-| lamma.cpp | bloat16 - GGUF | Low | 66.9 t/s |
+### 1. Pure Text Benchmark (Clinical Essay Reasoning)
 
+| Inference Engine | Model Data Type | Clinical Accuracy | Sustained Decode Speed | Prefill Throughput |
+| :--- | :--- | :--- | :--- | :--- |
+| **transformers** | Float32 | Very High | 27.99 t/s | — |
+| **metalliger** | Float32 | Better | 29.90 t/s | 506.7 t/s |
+| **transformers** | BFloat16 | Very High | 43.12 t/s | — |
+| **metalliger** | BFloat16 | Better | 48.50 t/s | 567.7 t/s |
+| **mlx-vlm** | BFloat16 | Average | 35.81 t/s | 699.1 t/s |
+| **llama.cpp** | Float16 (GGUF) | Low | 66.90 t/s | 878.2 t/s |
 
-> **Key Takeaway**: While MLX achieves fast prefill on raw prompt ingestion, **MetalLiger dominates in sustained autoregressive token generation (+35% faster decode speed)** and avoids the precision loss or template mismatch that caused MLX to misdiagnose the medical scan.
+---
+
+### 2. Multimodal Visual QA Benchmark (High-Resolution Histopathology)
+
+| Inference Engine | Model Data Type | Clinical Accuracy | Sustained Decode Speed | Prefill Throughput |
+| :--- | :--- | :--- | :--- | :--- |
+| **transformers** | Float32 | Very High | 25.62 t/s | — |
+| **metalliger** | Float32 | Better | 29.60 t/s | 525.0 t/s |
+| **transformers** | BFloat16 | Low *(Methotrexate Error)* | 38.84 t/s | — |
+| **metalliger** | BFloat16 | Average *(MGMT Hallucination)* | 47.70 t/s | 732.9 t/s |
 
 ---
 
