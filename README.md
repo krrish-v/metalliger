@@ -25,11 +25,11 @@
 
 ## Overview
 
-**MetalLiger** brings Liger Kernel-style operator fusion, Flash Attention, and zero-allocation static KV caching to Apple's **Metal Performance Shaders (MPS)** backend.
+**MetalLiger** brings Liger Kernel-style operator fusion, Flash Attention, and zero-allocation static KV caching to Apple's Metal Performance Shaders (MPS) backend.
 
 Running LLMs and Vision-Language Models (VLMs) on Apple Silicon has traditionally forced developers into a trade-off:
-- **MLX / MLX-VLM**: Fast, but requires converting weights to a proprietary ecosystem, often altering numerics, breaking PyTorch tooling, and introducing precision drift.
-- **Vanilla PyTorch MPS**: Ecosystem compatibility, but bogged down by Python-to-C++ dispatch overhead, dynamic memory allocations, and fragmented Metal GPU kernels.
+- MLX / MLX-VLM: Fast, but requires converting weights to a proprietary ecosystem, often altering numerics, breaking PyTorch tooling, and introducing precision drift.
+- Vanilla PyTorch MPS: Ecosystem compatibility, but bogged down by Python-to-C++ dispatch overhead, dynamic memory allocations, and fragmented Metal GPU kernels.
 
 **MetalLiger eliminates the compromise.** By running **100% native PyTorch** with fused Metal kernels, pre-allocated static memory buffers, and MPS Flash Attention, MetalLiger outperforms MLX-VLM in autoregressive token generation speed while preserving exact model reasoning quality.
 
@@ -41,11 +41,11 @@ Running LLMs and Vision-Language Models (VLMs) on Apple Silicon has traditionall
 
 ![MetalLiger Speedup](readme_img/metalliger_speedup.png)
 
-Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` architecture model:
+Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` (`madrisight/madrimed1.2-VL-2B`) architecture model:
 
-### 1. Pure Text Benchmark (Clinical Essay Reasoning)
+### 1. Text
 
-| Inference Engine | Model Data Type | Clinical Accuracy | Sustained Decode Speed | Prefill Throughput |
+| Inference Engine | Data Type | Accuracy | Decode Speed | Prefill Throughput |
 | :--- | :--- | :--- | :--- | :--- |
 | **transformers** | Float32 | Very High | 27.99 t/s | — |
 | **metalliger** | Float32 | Better | 29.90 t/s | 506.7 t/s |
@@ -56,14 +56,14 @@ Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` architecture model:
 
 ---
 
-### 2. Multimodal Visual QA Benchmark (High-Resolution Histopathology)
+### 2. Visual QA 
 
-| Inference Engine | Model Data Type | Clinical Accuracy | Sustained Decode Speed | Prefill Throughput |
+| Inference Engine | Data Type | Accuracy | Decode Speed | Prefill Throughput |
 | :--- | :--- | :--- | :--- | :--- |
 | **transformers** | Float32 | Very High | 25.62 t/s | — |
 | **metalliger** | Float32 | Better | 29.60 t/s | 525.0 t/s |
-| **transformers** | BFloat16 | Low *(Methotrexate Error)* | 38.84 t/s | — |
-| **metalliger** | BFloat16 | Average *(MGMT Hallucination)* | 47.70 t/s | 732.9 t/s |
+| **transformers** | BFloat16 | Average | 38.84 t/s | — |
+| **metalliger** | BFloat16 | Average | 47.70 t/s | 732.9 t/s |
 
 ---
 
