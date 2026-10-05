@@ -124,8 +124,8 @@ from metalliger.inference import InferenceEngine
 engine = InferenceEngine(
     model_id="<qwen_3vl_model_path>",
     max_seq_len=4096,
-    dtype=torch.float32,   # Native half-precision (matches fine-tuning weights)
-    use_compile=False      # Stable fused eager mode
+    dtype=torch.float32,
+    use_compile=False
 )
 
 # 2. Run multimodal vision-language inference
