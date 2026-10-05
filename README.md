@@ -127,7 +127,8 @@ response = engine.generate(
     text_prompt=prompt,
     images=[image],
     max_new_tokens=512,
-    temperature=0.0  # Greedy decoding for high diagnostic precision
+    temperature=0.0,  # Greedy decoding for high diagnostic precision
+    verbose=True
 )
 
 print(response)
