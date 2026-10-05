@@ -43,7 +43,7 @@ def is_mps_flash_attn_available() -> bool:
     """Check if mps-flash-attention is installed and functional."""
     try:
         from mps_flash_attn import is_available
-        return is_available()
+        return is_available
     except ImportError:
         return False
 
