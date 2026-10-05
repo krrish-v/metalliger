@@ -34,7 +34,7 @@ Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` architecture model:
 | Inference type | Model data type | Average Accuracy | Average Tokens/sec |
 | :--- | :--- | :--- | :--- |
 | transformers | Float32 | Very High | 27.98 t/sec |
-| metalliger | Float32 | Better | 29.8 t/s |
+| metalliger | Float32 | Better | 29.9 t/s |
 | transformers | bloat16 | Very High | 43.19 t/sec |
 | metalliger | bloat16 | Better | 48.5 t/s |
 | mlx-vlm | bloat16 | Average | 35.810 t/s |
@@ -102,7 +102,7 @@ from metalliger.inference import InferenceEngine
 engine = InferenceEngine(
     model_id="<qwen_3vl_model_path>",
     max_seq_len=4096,
-    dtype=torch.bfloat16,   # Native half-precision (matches fine-tuning weights)
+    dtype=torch.float32,   # Native half-precision (matches fine-tuning weights)
     use_compile=False      # Stable fused eager mode
 )
 
