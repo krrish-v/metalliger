@@ -51,6 +51,7 @@ class MetalLigerStaticCache(Cache):
             for _ in range(self.num_layers)
         ]
         self.seen_tokens = 0
+        self._update_start = 0
 
     @property
     def batch_size(self):
@@ -67,7 +68,12 @@ class MetalLigerStaticCache(Cache):
         """Update the cache and return the full history."""
         batch_size, num_heads, seq_len, head_dim = key_states.shape
         
-        start = self.seen_tokens
+        # Advance position only on layer 0 (matching M4StaticCache in inference.py)
+        if layer_idx == 0:
+            self._update_start = self.seen_tokens
+            self.seen_tokens += seq_len
+        
+        start = self._update_start
         end = start + seq_len
         
         k_buf = self.key_cache[layer_idx]
@@ -146,7 +152,7 @@ class MetalLigerGenerator:
             return_dict=True,
             **kwargs
         )
-        cache.seen_tokens += prompt_len
+        # seen_tokens is now advanced inside cache.update()
         
         logits = outputs.logits[:, -1, :]
         next_token = torch.argmax(logits, dim=-1, keepdim=True)
@@ -176,7 +182,7 @@ class MetalLigerGenerator:
                 return_dict=True,
                 **step_kwargs
             )
-            cache.seen_tokens += 1
+            # seen_tokens is now advanced inside cache.update()
             if cur_position_ids is not None:
                 cur_position_ids = cur_position_ids + 1
             
