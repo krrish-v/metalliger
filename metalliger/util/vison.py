@@ -497,7 +497,6 @@ class UNClinicalGraphRAGEngine:
 
         # 5. Register scoring methods
         self.methods_registry = {
-            "1_layer0_boundary_pro": self.score_medmax_chat_aligned,
             "balanced_vision_boundary": self.score_medmax_chat_aligned,
             "fast_layer0_static": lambda q: self.score_medmax_chat_aligned(
                 q, layer0_weight=1.0
