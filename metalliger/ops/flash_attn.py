@@ -43,7 +43,7 @@ def is_mps_flash_attn_available() -> bool:
     """Check if mps-flash-attention is installed and functional."""
     try:
         from mps_flash_attn import is_available
-        return is_available
+        return is_available()
     except ImportError:
         return False
 
@@ -137,11 +137,12 @@ def _apply_sdpa_patch(min_seq_len: int = 32, debug: bool = False):
                     k = k.unsqueeze(1)
                     v = v.unsqueeze(1)
 
-                # Handle GQA: expand KV heads to match Q heads if needed
+                # Handle GQA: expand KV heads to match Q heads via zero-copy views
                 if q.shape[1] != k.shape[1]:
                     n_rep = q.shape[1] // k.shape[1]
-                    k = k.repeat_interleave(n_rep, dim=1)
-                    v = v.repeat_interleave(n_rep, dim=1)
+                    b, h_kv, s, d = k.shape
+                    k = k[:, :, None, :, :].expand(b, h_kv, n_rep, s, d).reshape(b, h_kv * n_rep, s, d)
+                    v = v[:, :, None, :, :].expand(b, h_kv, n_rep, s, d).reshape(b, h_kv * n_rep, s, d)
 
                 # Convert mask: PyTorch SDPA vs MFA have inverted conventions
                 mfa_mask = None
@@ -171,10 +172,10 @@ def _apply_sdpa_patch(min_seq_len: int = 32, debug: bool = False):
                         scale_factor = scale / default_scale
                         q = q * scale_factor
 
-                # Ensure tensors are contiguous for C++ pointer access
-                q = q.contiguous()
-                k = k.contiguous()
-                v = v.contiguous()
+                # Ensure tensors are contiguous for C++ pointer access (skip if already contiguous)
+                if not q.is_contiguous(): q = q.contiguous()
+                if not k.is_contiguous(): k = k.contiguous()
+                if not v.is_contiguous(): v = v.contiguous()
 
                 # Fast-path for inference: forward without allocating or writing logsumexp
                 is_infer = not (torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad))
