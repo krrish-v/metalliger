@@ -5,13 +5,13 @@ Provides vision and text multimodal processing and clinical Graph RAG modules.
 """
 
 try:
-    from .vison import (
+    from ..vison import (
         func,
         ClinicalRetrievalResult,
         UNClinicalGraphRAGEngine,
         GraphRAG,
     )
-    from .text import (
+    from ..text import (
         TextFunc,
         ClinicalTextRetrievalResult,
         UNClinicalTextGraphRAGEngine,
