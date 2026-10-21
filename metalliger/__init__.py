@@ -23,30 +23,42 @@ Usage (Training / Monkey-patching):
 
 __version__ = "0.5.0"
 
-from metalliger.ops.fused_rms_norm import MetalLigerRMSNorm
-from metalliger.ops.fused_swiglu import MetalLigerSwiGLU
-from metalliger.ops.fused_rope import MetalLigerRoPE
-from metalliger.ops.fused_linear_cross_entropy import MetalLigerFusedLinearCrossEntropy
-from metalliger.ops.fused_lora import (
-    apply_fused_lora_qkv,
-    apply_fused_lora_mlp,
-    patch_fused_lora,
-)
-from metalliger.patch import apply_metalliger_to_qwen3vl, apply_metalliger_to_qwen3_5
-from metalliger.ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
-
-# Phase 4: torch.compile wrapper
-from metalliger._compile import apply_compile
-
-# DeepSpeed-inspired: Contiguous gradient buffer
-from metalliger.contiguous_grad_buffer import ContiguousGradBuffer
-
-# High-Performance Inference Engine & Zero-Allocation KV Cache
-from metalliger.inference import InferenceEngine
-from metalliger.generation import M4StaticCache
+try:
+    from .ops.fused_rms_norm import MetalLigerRMSNorm
+    from .ops.fused_swiglu import MetalLigerSwiGLU
+    from .ops.fused_rope import MetalLigerRoPE
+    from .ops.fused_linear_cross_entropy import MetalLigerFusedLinearCrossEntropy
+    from .ops.fused_lora import (
+        apply_fused_lora_qkv,
+        apply_fused_lora_mlp,
+        patch_fused_lora,
+    )
+    from .patch import apply_metalliger_to_qwen3vl, apply_metalliger_to_qwen3_5
+    from .ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
+    from ._compile import apply_compile
+    from .contiguous_grad_buffer import ContiguousGradBuffer
+    from .inference import InferenceEngine
+    from .generation import M4StaticCache
+    from ._torch_library import register_metalliger_ops
+except ImportError:
+    from metalliger.ops.fused_rms_norm import MetalLigerRMSNorm
+    from metalliger.ops.fused_swiglu import MetalLigerSwiGLU
+    from metalliger.ops.fused_rope import MetalLigerRoPE
+    from metalliger.ops.fused_linear_cross_entropy import MetalLigerFusedLinearCrossEntropy
+    from metalliger.ops.fused_lora import (
+        apply_fused_lora_qkv,
+        apply_fused_lora_mlp,
+        patch_fused_lora,
+    )
+    from metalliger.patch import apply_metalliger_to_qwen3vl, apply_metalliger_to_qwen3_5
+    from metalliger.ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
+    from metalliger._compile import apply_compile
+    from metalliger.contiguous_grad_buffer import ContiguousGradBuffer
+    from metalliger.inference import InferenceEngine
+    from metalliger.generation import M4StaticCache
+    from metalliger._torch_library import register_metalliger_ops
 
 # Phase 4e: Register native ops with torch.library (no-op if C++ ext not built yet)
-from metalliger._torch_library import register_metalliger_ops
 register_metalliger_ops()
 
 
