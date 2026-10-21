@@ -126,5 +126,4 @@ __all__ = [
     "ContiguousGradBuffer",
     # Utilities
     "utils",
-    "util",
 ]
