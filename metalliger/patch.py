@@ -14,16 +14,16 @@ Qwen3.5 ARCHITECTURE NOTES:
     - Qwen3_5Attention       (standard GQA)          — layers 3, 7, 11, 15…
 
   SAFE to fuse:
-    ✅ input_layernorm / post_attention_layernorm  (plain Qwen3_5RMSNorm)
-    ✅ Qwen3_5MLP with gate_proj/up_proj/down_proj  (SwiGLU, all 24 layers)
-    ✅ Final language model norm (Qwen3_5RMSNorm)
+    input_layernorm / post_attention_layernorm  (plain Qwen3_5RMSNorm)
+    Qwen3_5MLP with gate_proj/up_proj/down_proj  (SwiGLU, all 24 layers)
+    Final language model norm (Qwen3_5RMSNorm)
 
   MUST NOT fuse:
-    ❌ Qwen3_5RMSNormGated inside GatedDeltaNet.norm
+    Qwen3_5RMSNormGated inside GatedDeltaNet.norm
        — uses a gated forward path with state: output = norm(x) * sigmoid(gate)
        — different math than plain RMSNorm; replacing it silently corrupts SSM state
-    ❌ Vision encoder LayerNorm / GELU — not RMSNorm, different eps semantics
-    ❌ q_norm / k_norm inside Qwen3_5Attention — small [256]-dim, not a perf target
+    Vision encoder LayerNorm / GELU — not RMSNorm, different eps semantics
+    q_norm / k_norm inside Qwen3_5Attention — small [256]-dim, not a perf target
 """
 
 import logging
