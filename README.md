@@ -103,6 +103,7 @@ git clone  https://github.com/krrish-v/metalliger
 
 
 # Install core Python dependencies
+cd metalliger
 pip install -r requirements.txt
 
 # Install MetalLiger in editable mode
