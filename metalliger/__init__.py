@@ -1,27 +1,27 @@
-# Copyright 2025 MetalLiger Contributors
+# Copyright 2025-2026 MetalLiger Contributors
 # Licensed under the Apache License 2.0
 """
-MetalLiger — Fused Metal kernels for PyTorch MPS training on Apple Silicon.
+MetalLiger — Fused Metal kernels for PyTorch MPS training & inference on Apple Silicon.
 
 Brings Liger Kernel-style operator fusion to Apple's Metal GPU backend,
 eliminating intermediate tensor allocations and reducing Metal dispatch overhead
-by 50%+ for transformer training.
+by 50%+ for transformer training and autoregressive VLM inference.
 
-Phases:
-  Phase 3 (active):  Python autograd.Function fused ops (RMSNorm, SwiGLU, RoPE, CE)
-  Phase 4a (active): torch.compile graph capture (use_metalliger_compile=True)
-  Phase 4b-e (build): Native C++ Metal dispatch + torch.library registration
-                       Build: python metalliger/setup_ext.py build_ext --inplace
+Usage (Inference):
+    from metalliger import InferenceEngine
+    from PIL import Image
 
-Usage:
+    engine = InferenceEngine(model_id="Qwen/Qwen3-VL-4B")
+    response = engine.generate(text_prompt="Explain this scan", images=[Image.open("scan.png")])
+
+Usage (Training / Monkey-patching):
     from metalliger import apply_metalliger_to_qwen3vl
 
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-VL-4B")
     model = apply_metalliger_to_qwen3vl(model)
-    # Training proceeds as normal — all ops are fused under the hood
 """
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 from metalliger.ops.fused_rms_norm import MetalLigerRMSNorm
 from metalliger.ops.fused_swiglu import MetalLigerSwiGLU
@@ -40,6 +40,10 @@ from metalliger._compile import apply_compile
 
 # DeepSpeed-inspired: Contiguous gradient buffer
 from metalliger.contiguous_grad_buffer import ContiguousGradBuffer
+
+# High-Performance Inference Engine & Zero-Allocation KV Cache
+from metalliger.inference import InferenceEngine
+from metalliger.generation import M4StaticCache
 
 # Phase 4e: Register native ops with torch.library (no-op if C++ ext not built yet)
 from metalliger._torch_library import register_metalliger_ops
@@ -71,24 +75,28 @@ def _disable_transformers_causal_conv1d():
 _disable_transformers_causal_conv1d()
 
 __all__ = [
-    # Phase 3: Python fused ops
+    "__version__",
+    # Inference
+    "InferenceEngine",
+    "M4StaticCache",
+    # Fused ops
     "MetalLigerRMSNorm",
     "MetalLigerSwiGLU",
     "MetalLigerRoPE",
     "MetalLigerFusedLinearCrossEntropy",
     "apply_metalliger_to_qwen3vl",
     "apply_metalliger_to_qwen3_5",
-    # Phase 3.5: Fused LoRA QKV + MLP backward
+    # Fused LoRA QKV + MLP backward
     "apply_fused_lora_qkv",
     "apply_fused_lora_mlp",
     "patch_fused_lora",
-    # Phase 4a
+    # Compilation
     "apply_compile",
-    # Phase 4e
+    # Torch library registration
     "register_metalliger_ops",
-    # Phase 6: MPS Flash Attention
+    # MPS Flash Attention
     "apply_mps_flash_attention",
     "is_mps_flash_attn_available",
-    # DeepSpeed-inspired: Contiguous Gradient Buffer
+    # Contiguous Gradient Buffer
     "ContiguousGradBuffer",
 ]
