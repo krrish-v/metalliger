@@ -24,24 +24,24 @@ Usage (Training / Monkey-patching):
 __version__ = "0.5.0"
 
 try:
-    from ..ops.fused_rms_norm import MetalLigerRMSNorm
-    from ..ops.fused_swiglu import MetalLigerSwiGLU
-    from ..ops.fused_rope import MetalLigerRoPE
-    from ..ops.fused_linear_cross_entropy import MetalLigerFusedLinearCrossEntropy
-    from ..ops.fused_lora import (
+    from .ops.fused_rms_norm import MetalLigerRMSNorm
+    from .ops.fused_swiglu import MetalLigerSwiGLU
+    from .ops.fused_rope import MetalLigerRoPE
+    from .ops.fused_linear_cross_entropy import MetalLigerFusedLinearCrossEntropy
+    from .ops.fused_lora import (
         apply_fused_lora_qkv,
         apply_fused_lora_mlp,
         patch_fused_lora,
     )
-    from ..patch import apply_metalliger_to_qwen3vl, apply_metalliger_to_qwen3_5
-    from ..ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
-    from .._compile import apply_compile
-    from ..contiguous_grad_buffer import ContiguousGradBuffer
-    from ..inference import InferenceEngine
-    from ..generation import M4StaticCache
-    from .._torch_library import register_metalliger_ops
-    from .. import utils
-    from .. import util
+    from .patch import apply_metalliger_to_qwen3vl, apply_metalliger_to_qwen3_5
+    from .ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
+    from ._compile import apply_compile
+    from .contiguous_grad_buffer import ContiguousGradBuffer
+    from .inference import InferenceEngine
+    from .generation import M4StaticCache
+    from ._torch_library import register_metalliger_ops
+    from . import utils
+    from . import util
 except ImportError:
     from metalliger.ops.fused_rms_norm import MetalLigerRMSNorm
     from metalliger.ops.fused_swiglu import MetalLigerSwiGLU
@@ -59,16 +59,13 @@ except ImportError:
     from metalliger.inference import InferenceEngine
     from metalliger.generation import M4StaticCache
     from metalliger._torch_library import register_metalliger_ops
-    try:
-        from metalliger import utils
-        from metalliger import util
-    except ImportError:
-        pass
+    from metalliger import utils
+
 
 # Phase 4e: Register native ops with torch.library (no-op if C++ ext not built yet)
 register_metalliger_ops()
 
-# Compatibility alias for nested git clone imports: from metalliger.metalliger...
+# Compatibility alias for nested git clone imports: from metalliger.metalliger.
 import sys
 _current_module = sys.modules.get(__name__)
 if _current_module is not None:
