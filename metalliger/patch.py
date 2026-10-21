@@ -1,672 +1,523 @@
-"""
-M4 Pro Native PyTorch Inference Engine (Optimized)
-Achieves near MLX-VLM speeds without model conversion.
+# Copyright 2025 MetalLiger Contributors
+"""Monkey-patching system for HuggingFace models.
 
-Core Innovations:
-1. Compiled/Optimized Decode Step: Eliminates Python->Metal dispatch latency.
-2. Fused Operations: Native F.rms_norm, SwiGLU (bfloat16 fused GEMM), and precision-hardened DeltaNet.
-3. Inference-Adaptive DeltaNet: float32 state accumulation during prefill, native bf16 decode projections.
-4. True Zero-Sync Repetition Penalty: Static-shape boolean masking via torch.where (no torch.unique stalls).
-5. M4StaticCache: Zero-allocation KV cache — pre-allocated once and reused across queries.
-6. Unified Memory-Efficient Prefill: Slices hidden states before lm_head on vision & text to eliminate 500+ MB logits allocations.
-7. Top-K Guided Nucleus Sampling: Bypasses redundant 152k radix sorting.
-8. Single-Commit Command Pipelining: Keeps the Apple Silicon GPU command queue saturated.
+Replaces standard model operations with MetalLiger fused equivalents.
+Designed for minimal API surface — one function call to fuse everything.
+
+Supported architectures:
+  - Qwen3-VL  (pure transformer + vision):  apply_metalliger_to_qwen3vl()
+  - Qwen3.5   (hybrid SSM+Attention + vision): apply_metalliger_to_qwen3_5()
+
+Qwen3.5 ARCHITECTURE NOTES:
+  The language model alternates between two layer types in a 3:1 pattern:
+    - Qwen3_5GatedDeltaNet  (linear SSM attention) — layers 0-2, 4-6, 8-10…
+    - Qwen3_5Attention       (standard GQA)          — layers 3, 7, 11, 15…
+
+  SAFE to fuse:
+    ✅ input_layernorm / post_attention_layernorm  (plain Qwen3_5RMSNorm)
+    ✅ Qwen3_5MLP with gate_proj/up_proj/down_proj  (SwiGLU, all 24 layers)
+    ✅ Final language model norm (Qwen3_5RMSNorm)
+
+  MUST NOT fuse:
+    ❌ Qwen3_5RMSNormGated inside GatedDeltaNet.norm
+       — uses a gated forward path with state: output = norm(x) * sigmoid(gate)
+       — different math than plain RMSNorm; replacing it silently corrupts SSM state
+    ❌ Vision encoder LayerNorm / GELU — not RMSNorm, different eps semantics
+    ❌ q_norm / k_norm inside Qwen3_5Attention — small [256]-dim, not a perf target
 """
 
-import os
-import time
+import logging
+from typing import Optional
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from PIL import Image
-from typing import Optional, List
 
-# Fallback-safe model imports across transformers versions
-from transformers import AutoProcessor
 try:
-    from transformers import Qwen3VLForConditionalGeneration
+    from .ops.fused_rms_norm import MetalLigerRMSNorm
+    from .ops.fused_swiglu import MetalLigerSwiGLU
+    from .ops.fused_lora import patch_fused_lora
+    from .ops.fused_deltanet import patch_deltanet
+    from .ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
+    from .generation import patch_generator
 except ImportError:
-    try:
-        from transformers import Qwen2_5_VLForConditionalGeneration as Qwen3VLForConditionalGeneration
-    except ImportError:
-        from transformers import AutoModelForVision2Seq as Qwen3VLForConditionalGeneration
-
-# 1. Environment Hardening for Apple Silicon (PyTorch Optimized)
-os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
-
-def set_mps_memory_fraction(fraction: float = 1.0):
-    """Safely configure MPS Unified Memory allocation limit."""
-    if hasattr(torch.mps, "set_per_process_memory_fraction"):
-        try:
-            torch.mps.set_per_process_memory_fraction(fraction)
-        except Exception:
-            pass
-
-set_mps_memory_fraction(1.0)
-
-HAS_LIGER = False
-HAS_FLASH_ATTN = False
-HAS_FLA = False
-
-try:
-    from metalliger.patch import apply_metalliger_to_qwen3vl
-    from metalliger.ops.fused_deltanet import patch_deltanet, UpcastConv1d
-    HAS_LIGER = True
-except ImportError:
-    try:
-        from .patch import apply_metalliger_to_qwen3vl
-        from .ops.fused_deltanet import patch_deltanet, UpcastConv1d
-        HAS_LIGER = True
-    except ImportError:
-        pass
-
-try:
+    from metalliger.ops.fused_rms_norm import MetalLigerRMSNorm
+    from metalliger.ops.fused_swiglu import MetalLigerSwiGLU
+    from metalliger.ops.fused_lora import patch_fused_lora
+    from metalliger.ops.fused_deltanet import patch_deltanet
     from metalliger.ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
-    HAS_FLASH_ATTN = is_mps_flash_attn_available()
-except ImportError:
-    try:
-        from .ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
-        HAS_FLASH_ATTN = is_mps_flash_attn_available()
-    except ImportError:
-        pass
+    from metalliger.generation import patch_generator
 
-try:
-    import fla
-    HAS_FLA = True
-except ImportError:
-    pass
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# M4StaticCache: Zero-Allocation KV Cache
-# ---------------------------------------------------------------------------
-from transformers.cache_utils import DynamicCache
 
-class M4StaticCache(DynamicCache):
+def _find_layers(model: nn.Module):
+    """Find transformer decoder layers regardless of model wrapping.
+
+    Handles:
+      - Bare model: model.model.layers (Qwen3VLForConditionalGeneration)
+      - PEFT-wrapped: model.base_model.model.model.layers (PeftModel → LoraModel → Qwen3VL)
+      - Other nesting: walks up to 5 levels deep looking for a 'layers' attribute
     """
-    Pre-allocated KV cache for Apple Silicon unified memory.
-    Subclasses DynamicCache to inherit HuggingFace protocol methods while
-    performing in-place tensor writes instead of torch.cat.
-    """
-    def __init__(self, max_seq_len: int, max_batch_size: int, num_kv_heads: int,
-                 head_dim: int, num_layers: int, device: torch.device, dtype: torch.dtype):
+    # All possible paths to transformer layers, ordered most-specific first
+    candidates = [
+        # PEFT + Qwen3-VL: peft_model.base_model.model.model.language_model.layers
+        lambda m: getattr(getattr(getattr(getattr(getattr(m, 'base_model', None), 'model', None), 'model', None), 'language_model', None), 'layers', None),
+        
+        # PEFT wrapped (LoRA): PeftModel.base_model.model.model.layers
+        lambda m: getattr(getattr(getattr(getattr(m, 'base_model', None), 'model', None), 'model', None), 'layers', None),
+        
+        # Qwen3-VL nested architecture: model.model.language_model.layers
+        lambda m: getattr(getattr(getattr(m, 'model', None), 'language_model', None), 'layers', None),
+        
+        # Standard HF: model.model.layers
+        lambda m: getattr(getattr(m, 'model', None), 'layers', None),
+        
+        # Direct: model.layers
+        lambda m: getattr(m, 'layers', None),
+        
+        # Accelerate wrapped
+        lambda m: getattr(getattr(getattr(m, 'module', None), 'model', None), 'layers', None),
+    ]
+
+    for getter in candidates:
         try:
-            super().__init__()
-        except (TypeError, ValueError):
-            self.layers = []
-            self.layer_class_to_replicate = None
-        self._seen_tokens = 0
-        self._max_seq_len = max_seq_len
-        self._current_pos = 0
+            layers = getter(model)
+            if layers is not None and len(layers) > 0:
+                return layers
+        except (AttributeError, TypeError):
+            continue
 
-        self.key_cache = [
-            torch.zeros((max_batch_size, num_kv_heads, max_seq_len, head_dim),
-                         device=device, dtype=dtype)
-            for _ in range(num_layers)
-        ]
-        self.value_cache = [
-            torch.zeros((max_batch_size, num_kv_heads, max_seq_len, head_dim),
-                         device=device, dtype=dtype)
-            for _ in range(num_layers)
-        ]
-        self._num_layers = num_layers
+    return None
 
-    def reset(self):
-        """Reset sequence pointers for zero-allocation cache reuse."""
-        self._seen_tokens = 0
-        self._current_pos = 0
 
-    def update(self, key_states: torch.Tensor, value_states: torch.Tensor,
-               layer_idx: int, cache_kwargs=None):
-        seq_len = key_states.shape[2]
-        if layer_idx == 0:
-            self._current_pos = self._seen_tokens
-            self._seen_tokens += seq_len
-        start = self._current_pos
-        end = start + seq_len
+def _find_final_norm(model: nn.Module):
+    """Find the final RMSNorm (model.model.norm or deeper)."""
+    candidates = [
+        # PEFT + Qwen3-VL
+        lambda m: getattr(getattr(getattr(getattr(getattr(m, 'base_model', None), 'model', None), 'model', None), 'language_model', None), 'norm', None),
+        
+        # Qwen3-VL nested architecture
+        lambda m: getattr(getattr(getattr(m, 'model', None), 'language_model', None), 'norm', None),
+        
+        # Standard PEFT
+        lambda m: getattr(getattr(getattr(getattr(m, 'base_model', None), 'model', None), 'model', None), 'norm', None),
+        
+        # Standard HF
+        lambda m: getattr(getattr(m, 'model', None), 'norm', None),
+    ]
+    for getter in candidates:
+        try:
+            norm = getter(model)
+            if norm is not None and hasattr(norm, 'weight'):
+                return norm, getter
+        except (AttributeError, TypeError):
+            continue
+    return None, None
 
-        if end > self._max_seq_len:
-            raise RuntimeError(
-                f"M4StaticCache: sequence exceeded max_seq_len={self._max_seq_len}. "
-                f"Increase max_seq_len when creating InferenceEngine."
+
+def _replace_rms_norms(model: nn.Module) -> int:
+    """Replace all RMSNorm layers with MetalLiger fused versions.
+
+    Returns the number of layers replaced.
+    """
+    count = 0
+
+    layers = _find_layers(model)
+    if layers is None:
+        logger.warning("MetalLiger: could not find transformer layers for RMSNorm patching")
+        return 0
+
+    for layer in layers:
+        # Input layernorm
+        if hasattr(layer, 'input_layernorm'):
+            old_norm = layer.input_layernorm
+            eps = getattr(old_norm, 'variance_epsilon',
+                          getattr(old_norm, 'eps', 1e-6))
+            hidden_size = old_norm.weight.shape[0]
+            new_norm = MetalLigerRMSNorm(
+                hidden_size=hidden_size,
+                eps=eps,
+                weight=old_norm.weight.data,
             )
+            layer.input_layernorm = new_norm
+            count += 1
 
-        self.key_cache[layer_idx][:, :, start:end, :] = key_states
-        self.value_cache[layer_idx][:, :, start:end, :] = value_states
-        return self.key_cache[layer_idx][:, :, :end, :], self.value_cache[layer_idx][:, :, :end, :]
+        # Post-attention layernorm
+        if hasattr(layer, 'post_attention_layernorm'):
+            old_norm = layer.post_attention_layernorm
+            eps = getattr(old_norm, 'variance_epsilon',
+                          getattr(old_norm, 'eps', 1e-6))
+            hidden_size = old_norm.weight.shape[0]
+            new_norm = MetalLigerRMSNorm(
+                hidden_size=hidden_size,
+                eps=eps,
+                weight=old_norm.weight.data,
+            )
+            layer.post_attention_layernorm = new_norm
+            count += 1
 
-    def get_seq_length(self, layer_idx: int = 0) -> int:
-        return self._seen_tokens
-
-    def get_max_length(self) -> int:
-        return self._max_seq_len
-
-    def get_mask_sizes(self, query_length: int, layer_idx: int = 0):
-        return self._seen_tokens + query_length, self._seen_tokens
-
-    @property
-    def seen_tokens(self) -> int:
-        return self._seen_tokens
-
-    def __len__(self):
-        return self._num_layers
-
-# ---------------------------------------------------------------------------
-# Helper: resolve language-model config
-# ---------------------------------------------------------------------------
-def _get_lm_config(model_config):
-    if hasattr(model_config, "text_config") and hasattr(model_config.text_config, "hidden_size"):
-        return model_config.text_config
-    if hasattr(model_config, "hidden_size"):
-        return model_config
-    raise AttributeError(
-        f"Cannot resolve language model config from {type(model_config).__name__}."
-    )
-
-# ---------------------------------------------------------------------------
-# InferenceEngine
-# ---------------------------------------------------------------------------
-class InferenceEngine:
-    def __init__(self, model_id: str, max_seq_len: int = 2048, use_compile: bool = False,
-                 dtype=torch.bfloat16, memory_fraction: float = 1.0):
-        self.device = torch.device("mps")
-        set_mps_memory_fraction(memory_fraction)
-        if isinstance(dtype, str):
-            dtype = getattr(torch, dtype.replace("torch.", ""))
-        self.dtype = dtype
-        self.max_seq_len = max_seq_len
-        self.use_compile = use_compile
-        self.memory_fraction = memory_fraction
-        self.shared_cache: Optional[M4StaticCache] = None
-
-        print(f" Initializing M4 Pro Engine for {model_id} (dtype={self.dtype})...")
-        t0 = time.time()
-        self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-
+    # Final norm (handles PEFT wrapping)
+    old_norm, _ = _find_final_norm(model)
+    if old_norm is not None:
+        eps = getattr(old_norm, 'variance_epsilon',
+                      getattr(old_norm, 'eps', 1e-6))
+        hidden_size = old_norm.weight.shape[0]
+        new_norm = MetalLigerRMSNorm(
+            hidden_size=hidden_size,
+            eps=eps,
+            weight=old_norm.weight.data,
+        )
+        # Set the norm on the correct parent — use safe getattr chains
         try:
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_id,
-                torch_dtype=self.dtype,
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,
-            ).to(self.device)
-        except Exception:
-            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
-                model_id,
-                torch_dtype=self.dtype,
-                trust_remote_code=True,
-            ).to(self.device)
-
-        self.lm_config = _get_lm_config(self.model.config)
-        self.vocab_size = getattr(self.lm_config, "vocab_size", getattr(self.model.config, "vocab_size", 152064))
-
-        if HAS_LIGER:
-            print("- Injecting MetalLiger Fused Kernels (RMSNorm, SwiGLU)...")
-            self.model = apply_metalliger_to_qwen3vl(self.model)
-
-        if HAS_FLASH_ATTN and self.dtype in (torch.bfloat16, torch.float16, torch.float32):
-            apply_mps_flash_attention()
-            print("- Flash Attention: active (prefill speedup)")
-
-
-        self._patch_deltanet_inference_mode(self.model)
-        self.model.eval()
-        self._patch_rmsnorm_inference_mode(self.model)
-        self._patch_swiglu_inference_mode(self.model)
-
-        if self.use_compile:
-            backend = self._detect_best_compile_backend()
-            print(f" Compiling transformer layers individually (backend={backend}, dynamic=True)...")
-            layers = self._find_layers(self.model)
-            if layers is not None:
-                for i in range(len(layers)):
-                    layers[i].forward = torch.compile(layers[i].forward, backend=backend, dynamic=True)
-            self._warmup()
-        else:
-            print("- Running in stable eager mode with kernel fusions.")
-
-        print(f" Engine ready in {time.time() - t0:.2f}s")
-
-    def _detect_best_compile_backend(self) -> str:
-        if hasattr(torch, "_dynamo"):
-            import torch._dynamo as dynamo
-            dynamo.config.suppress_errors = True
-            dynamo.config.cache_size_limit = 64
-            if hasattr(dynamo.config, "dynamic_shapes"):
-                dynamo.config.dynamic_shapes = True
-        try:
-            probe_fn = torch.compile(lambda x: x * 2.0, backend="inductor", dynamic=True)
-            t = torch.ones(1, device="mps", dtype=self.dtype)
-            probe_fn(t)
-            return "inductor"
-        except Exception:
-            return "aot_eager"
-
-    def _find_layers(self, module: nn.Module) -> Optional[nn.ModuleList]:
-        for name, child in module.named_children():
-            if isinstance(child, nn.ModuleList) and name in ("layers", "blocks"):
-                return child
-            res = self._find_layers(child)
-            if res is not None:
-                return res
-        return None
-
-    def _patch_deltanet_inference_mode(self, model: nn.Module):
-        count = 0
-        def _patch_recursive(module):
-            nonlocal count
-            for name, child in module.named_children():
-                if type(child).__name__ == "Qwen3_5GatedDeltaNet":
-                    if hasattr(child, "conv1d") and not isinstance(child.conv1d, UpcastConv1d):
-                        child.conv1d = UpcastConv1d(child.conv1d)
-                    original_forward = child.__class__.forward
-                    def _make_forward(layer, orig_fwd):
-                        def forward(hidden_states, *args, **kwargs):
-                            orig_dtype = hidden_states.dtype
-                            if orig_dtype != torch.float32:
-                                h_f32 = hidden_states.float()
-                                with torch.autocast(device_type="mps", enabled=False):
-                                    result = orig_fwd(layer, h_f32, *args, **kwargs)
-                                if isinstance(result, tuple):
-                                    lst = list(result)
-                                    if isinstance(lst[0], torch.Tensor):
-                                        lst[0] = lst[0].to(orig_dtype)
-                                    return tuple(lst)
-                                return result.to(orig_dtype) if isinstance(result, torch.Tensor) else result
-                            return orig_fwd(layer, hidden_states, *args, **kwargs)
-                        return forward
-                    child.forward = _make_forward(child, original_forward)
-                    count += 1
-                _patch_recursive(child)
-        _patch_recursive(model)
-        if count > 0:
-            print(f"   Inference DeltaNet: {count} layers patched for stability")
-
-    def _patch_rmsnorm_inference_mode(self, model: nn.Module):
-        count = 0
-        has_native_rms = hasattr(F, "rms_norm")
-        for _, module in model.named_modules():
-            mod_name = type(module).__name__
-            if mod_name in ("MetalLigerRMSNorm", "Qwen3RMSNorm", "Qwen2RMSNorm", "RMSNorm"):
-                w = module.weight
-                e = getattr(module, "eps", getattr(module, "variance_epsilon", 1e-6))
-                dim = (w.shape[0],)
-                if has_native_rms:
-                    def _make_native_fwd(weight, eps, normalized_shape):
-                        return lambda x: F.rms_norm(x, normalized_shape, weight=weight, eps=eps)
-                    module.forward = _make_native_fwd(w, e, dim)
-                else:
-                    def _make_fast_fwd(weight, eps):
-                        def fast_fwd(x):
-                            variance = x.float().pow(2).mean(-1, keepdim=True)
-                            return (x * torch.rsqrt(variance + eps)).to(x.dtype) * weight
-                        return fast_fwd
-                    module.forward = _make_fast_fwd(w, e)
+            # PEFT + VLM: model.base_model.model.model.language_model.norm
+            peft_lang = getattr(getattr(getattr(getattr(model, 'base_model', None), 'model', None), 'model', None), 'language_model', None)
+            if peft_lang is not None and hasattr(peft_lang, 'norm'):
+                peft_lang.norm = new_norm
                 count += 1
-        if count > 0:
-            status = "fused F.rms_norm" if has_native_rms else "fast-path fallback"
-            print(f"   RMSNorm fast-path: {count} layers optimized ({status})")
+            # PEFT: model.base_model.model.model.norm
+            elif getattr(getattr(getattr(getattr(model, 'base_model', None), 'model', None), 'model', None), 'norm', None) is not None:
+                model.base_model.model.model.norm = new_norm
+                count += 1
+            # VLM (no PEFT): model.model.language_model.norm
+            elif getattr(getattr(getattr(model, 'model', None), 'language_model', None), 'norm', None) is not None:
+                model.model.language_model.norm = new_norm
+                count += 1
+            # Standard HF: model.model.norm
+            elif getattr(getattr(model, 'model', None), 'norm', None) is not None:
+                model.model.norm = new_norm
+                count += 1
+        except AttributeError as e:
+            logger.debug(f"MetalLiger: could not replace final norm. {e}")
 
-    def _patch_swiglu_inference_mode(self, model: nn.Module):
-        count = 0
-        for _, module in model.named_modules():
-            if type(module).__name__ in ("MetalLigerSwiGLU", "Qwen3MLP", "Qwen2MLP", "Qwen3_5MLP"):
-                if hasattr(module, "gate_proj") and hasattr(module, "up_proj") and hasattr(module, "down_proj"):
-                    gp, up, dp = module.gate_proj, module.up_proj, module.down_proj
-                    can_fuse_gemm = (
-                        isinstance(gp, nn.Linear) and isinstance(up, nn.Linear)
-                        and not hasattr(gp, "lora_A") and not hasattr(up, "lora_A")
-                        and gp.in_features == up.in_features
-                        and gp.out_features == up.out_features
-                    )
-                    if can_fuse_gemm:
-                        fused_w = torch.cat([gp.weight.data, up.weight.data], dim=0)
-                        fused_b = None
-                        if gp.bias is not None and up.bias is not None:
-                            fused_b = torch.cat([gp.bias.data, up.bias.data], dim=0)
-                        def _make_fused_gemm(w, b, down):
-                            def fused_fwd(x):
-                                gate_up = F.linear(x, w, b)
-                                gate, val = gate_up.chunk(2, dim=-1)
-                                return down(F.silu(gate) * val)
-                            return fused_fwd
-                        module.forward = _make_fused_gemm(fused_w, fused_b, dp)
-                    count += 1
-        if count > 0:
-            print(f"   SwiGLU fast-path: {count} MLP layers optimized for inference ({self.dtype})")
+    return count
 
-    def _warmup(self):
-        try:
-            lm_cfg = self.lm_config
-            num_kv_heads = getattr(lm_cfg, "num_key_value_heads", getattr(lm_cfg, "num_attention_heads", 16))
-            head_dim = getattr(lm_cfg, "head_dim", lm_cfg.hidden_size // lm_cfg.num_attention_heads)
-            num_layers = getattr(lm_cfg, "num_hidden_layers", 24)
-            dummy_ids = torch.zeros((1, 1), dtype=torch.long, device=self.device)
-            dummy_cache = M4StaticCache(
-                max_seq_len=64, max_batch_size=1, num_kv_heads=num_kv_heads,
-                head_dim=head_dim, num_layers=num_layers, device=self.device, dtype=self.dtype,
-            )
-            with torch.inference_mode():
-                self.model(input_ids=dummy_ids, past_key_values=dummy_cache, use_cache=True)
-            if hasattr(torch.mps, "commit"):
-                torch.mps.commit()
-            torch.mps.synchronize()
-        except Exception:
-            pass
 
-    def _sample_token(self, logits: torch.Tensor, temperature: float = 0.0,
-                      top_p: float = 1.0, top_k: int = 64) -> torch.Tensor:
-        """
-        Inference sampling fast-path. Greedy decoding bypasses sorting and distribution math.
-        """
-        if temperature <= 1e-5:
-            return torch.argmax(logits, dim=-1, keepdim=True)
+def _replace_mlps(model: nn.Module) -> int:
+    """Replace SwiGLU MLPs with MetalLiger fused versions.
 
-        vocab_size = logits.shape[-1]
-        k = min(top_k, vocab_size) if top_k > 0 else vocab_size
+    Returns the number of layers replaced.
+    """
+    count = 0
+    layers = _find_layers(model)
+    if layers is None:
+        return 0
 
-        # Only sort top_k if it actually bounds the vocabulary search
-        if k < vocab_size:
-            topk_logits, topk_indices = torch.topk(logits, k=k, dim=-1)
-        else:
-            topk_logits = logits
-            topk_indices = None
+    for layer in layers:
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+            original_mlp = layer.mlp
+            layer.mlp = MetalLigerSwiGLU(original_mlp)
+            count += 1
 
-        scaled_logits = topk_logits / temperature
-        topk_probs = F.softmax(scaled_logits, dim=-1)
+    return count
 
-        if top_p < 1.0:
-            cumulative_probs = torch.cumsum(topk_probs, dim=-1)
-            mask = cumulative_probs > top_p
-            mask[..., 1:] = mask[..., :-1].clone()
-            mask[..., 0] = False
-            topk_probs = topk_probs.masked_fill(mask, 0.0)
-            topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True)
 
-        selected_idx = torch.multinomial(topk_probs, num_samples=1)
-        if topk_indices is not None:
-            return torch.gather(topk_indices, -1, selected_idx)
-        return selected_idx
+def apply_metalliger_to_qwen3vl(
+    model: nn.Module,
+    fuse_rms_norm: bool = True,
+    fuse_swiglu: bool = True,
+    fuse_rope: bool = False,
+    fuse_cross_entropy: bool = False,
+    fuse_lora: bool = False,  # DISABLED: dynamic lambda-shadowing of q/k/v_proj causes silent
+                              # precision drift and logit erosion during extended training runs.
+                              # Standard PEFT backward is numerically safer. Memory cost: +1.8GB.
+    fuse_flash_attn: bool = False,  # Phase 6: MPS Flash Attention (disabled by default)
+    use_optimized_generator: bool = False, # DISABLED: breaks GRPO sampling
+) -> nn.Module:
+    """Apply MetalLiger fused operations to a Qwen3-VL model.
 
-    def _decode_step(self, next_token: torch.Tensor, cache,
-                     position_ids: Optional[torch.Tensor] = None,
-                     seen_mask: Optional[torch.Tensor] = None,
-                     repetition_penalty: float = 1.0,
-                     temperature: float = 0.0,
-                     top_p: float = 1.0,
-                     top_k: int = 64):
-        """Single-token decode with zero CPU-GPU sync repetition penalty."""
-        outputs = self.model(
-            input_ids=next_token,
-            position_ids=position_ids,
-            past_key_values=cache,
-            use_cache=True,
-            return_dict=False,
-        )
-        logits = outputs[0][:, -1, :]
-        new_cache = outputs[1]
+    This is the main entry point. Call once after loading the model.
 
-        # ⚡ Zero-Sync Repetition Penalty: Branchless static mask prevents pipeline stall
-        if repetition_penalty != 1.0 and seen_mask is not None:
-            penalized = torch.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty)
-            logits = torch.where(seen_mask, penalized, logits)
+    Args:
+        model: A Qwen3-VL model (or similar architecture)
+        fuse_rms_norm: Replace RMSNorm with fused version (default: True)
+        fuse_swiglu: Replace SwiGLU MLP with fused version (default: True)
+        fuse_rope: Replace RoPE with fused version (default: False — experimental)
+        fuse_cross_entropy: Whether to use fused CE (applied in trainer)
 
-        next_token_id = self._sample_token(
-            logits, temperature=temperature, top_p=top_p, top_k=top_k
+    Returns:
+        The same model with fused operations applied in-place
+    """
+    stats = {}
+
+    # Flash Attention is applied FIRST — patches F.scaled_dot_product_attention
+    # globally so all subsequent attention ops (in both patched and unpatched
+    # modules) automatically benefit from O(N) memory + 1.8x speedup.
+    if fuse_flash_attn:
+        success = apply_mps_flash_attention(bf16_backward=True)
+        stats['flash_attn'] = 'active' if success else 'unavailable'
+
+    if fuse_rms_norm:
+        n = _replace_rms_norms(model)
+        stats['rms_norm'] = n
+        logger.info(f"MetalLiger: replaced {n} RMSNorm layers with fused versions")
+
+    if fuse_swiglu:
+        n = _replace_mlps(model)
+        stats['swiglu'] = n
+        logger.info(f"MetalLiger: replaced {n} MLP layers with fused SwiGLU")
+
+    if fuse_lora:
+        n = patch_fused_lora(model)
+        stats['fused_lora'] = n
+        logger.info(f"MetalLiger: fused LoRA QKV+MLP marked {n} modules (Phase 3.5)")
+    else:
+        logger.info(
+            "MetalLiger: fused LoRA DISABLED (default). Using standard PEFT backward "
+            "for numerical stability. Set fuse_lora=True to re-enable (saves ~1.8GB but "
+            "risks precision drift on long runs)."
         )
 
-        # Update GPU-side token tracker without CPU sync
-        if seen_mask is not None:
-            seen_mask.scatter_(1, next_token_id, True)
+    if use_optimized_generator:
+        patch_generator(model)
+        stats['generator'] = 'optimized'
+        logger.info("MetalLiger: applied Phase 5 optimized MPS generator")
 
-        # Commit all ops (forward, penalty, sampling) in a single unified command batch
-        if hasattr(torch.mps, "commit"):
-            torch.mps.commit()
+    if fuse_rope:
+        logger.info("MetalLiger: fused RoPE is experimental — use apply_fused_rotary()")
+        stats['rope'] = 'available'
 
-        return next_token_id, new_cache
+    if fuse_cross_entropy:
+        logger.info("MetalLiger: fused CE — use MetalLigerFusedLinearCrossEntropy in trainer")
+        stats['cross_entropy'] = 'available'
 
-    @torch.inference_mode()
-    def generate(self, text_prompt: str = None, images: List[Image.Image] = None,
-                 max_new_tokens: int = 512, repetition_penalty: float = 1.0,
-                 messages: List[dict] = None, temperature: float = 0.0,
-                 top_p: float = 1.0, top_k: int = 64, verbose: bool = False) -> str:
-        if messages is not None:
-            text_prompt = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        elif text_prompt is not None:
-            if images is not None and ("<|image_pad|>" not in text_prompt and "<|vision_start|>" not in text_prompt):
-                user_content = [{"type": "image"} for _ in images]
-                user_content.append({"type": "text", "text": text_prompt})
-                auto_messages = [{"role": "user", "content": user_content}]
-                text_prompt = self.processor.apply_chat_template(
-                    auto_messages, tokenize=False, add_generation_prompt=True
-                )
-        else:
-            raise ValueError("Either text_prompt or messages must be provided.")
 
-        inputs = self.processor(
-            text=text_prompt,
-            images=images,
-            return_tensors="pt",
-        ).to(self.device)
 
-        input_ids = inputs.input_ids
-        batch_size, prompt_len = input_ids.shape
-        total_len = prompt_len + max_new_tokens
+    total = sum(v for v in stats.values() if isinstance(v, int))
+    logger.info(
+        f"MetalLiger: {total} total layers patched. "
+        f"Details: {stats}"
+    )
 
-        if total_len > self.max_seq_len:
-            self.max_seq_len = total_len + 256
-            self.shared_cache = None
+    return model
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Qwen3.5 Support (Hybrid SSM + Attention + Vision)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_language_layers_qwen3_5(model: nn.Module):
+    """Find the language_model decoder layers for Qwen3.5.
+
+    Qwen3.5 path: model.model.language_model.layers
+    PEFT-wrapped:  model.base_model.model.model.language_model.layers
+    """
+    candidates = [
+        lambda m: getattr(getattr(getattr(getattr(getattr(m, 'base_model', None), 'model', None), 'model', None), 'language_model', None), 'layers', None),
+        lambda m: getattr(getattr(getattr(m, 'model', None), 'language_model', None), 'layers', None),
+        lambda m: getattr(getattr(m, 'model', None), 'layers', None),
+        lambda m: getattr(m, 'layers', None),
+    ]
+    for getter in candidates:
         try:
-            lm_cfg = self.lm_config
-            num_kv_heads = getattr(lm_cfg, "num_key_value_heads", getattr(lm_cfg, "num_attention_heads", 16))
-            head_dim = getattr(lm_cfg, "head_dim", lm_cfg.hidden_size // lm_cfg.num_attention_heads)
-            num_layers = getattr(lm_cfg, "num_hidden_layers", 24)
+            layers = getter(model)
+            if layers is not None and len(layers) > 0:
+                return layers
+        except (AttributeError, TypeError):
+            continue
+    return None
 
-            if (self.shared_cache is not None and 
-                self.shared_cache.get_max_length() >= total_len and 
-                self.shared_cache.key_cache[0].shape[0] >= batch_size):
-                cache = self.shared_cache
-                cache.reset()
+
+def _find_final_norm_qwen3_5(model: nn.Module):
+    """Find the final language model RMSNorm for Qwen3.5."""
+    candidates = [
+        lambda m: getattr(getattr(getattr(getattr(getattr(m, 'base_model', None), 'model', None), 'model', None), 'language_model', None), 'norm', None),
+        lambda m: getattr(getattr(getattr(m, 'model', None), 'language_model', None), 'norm', None),
+        lambda m: getattr(getattr(m, 'model', None), 'norm', None),
+    ]
+    for getter in candidates:
+        try:
+            norm = getter(model)
+            if norm is not None and hasattr(norm, 'weight'):
+                # Guard: must be a plain RMSNorm, NOT the gated variant
+                cls_name = type(norm).__name__
+                if 'Gated' not in cls_name:
+                    return norm
+        except (AttributeError, TypeError):
+            continue
+    return None
+
+
+def _replace_rms_norms_qwen3_5(model: nn.Module) -> int:
+    """Replace standard RMSNorm layers in Qwen3.5 language model.
+
+    CRITICAL SAFETY RULE:
+    Only replaces input_layernorm and post_attention_layernorm — both are
+    plain Qwen3_5RMSNorm. The Qwen3_5RMSNormGated inside GatedDeltaNet.norm
+    is SKIPPED because it uses gated forward math incompatible with our
+    standard fused RMSNorm implementation.
+    """
+    count = 0
+    layers = _find_language_layers_qwen3_5(model)
+    if layers is None:
+        logger.warning("MetalLiger[Qwen3.5]: could not find language model layers")
+        return 0
+
+    for layer_idx, layer in enumerate(layers):
+        # input_layernorm — plain Qwen3_5RMSNorm in ALL layer types
+        if hasattr(layer, 'input_layernorm'):
+            old_norm = layer.input_layernorm
+            cls_name = type(old_norm).__name__
+            if 'Gated' not in cls_name:  # Safety guard
+                eps = getattr(old_norm, 'variance_epsilon', getattr(old_norm, 'eps', 1e-6))
+                new_norm = MetalLigerRMSNorm(
+                    hidden_size=old_norm.weight.shape[0],
+                    eps=eps,
+                    weight=old_norm.weight.data,
+                )
+                layer.input_layernorm = new_norm
+                count += 1
             else:
-                cache = M4StaticCache(
-                    max_seq_len=self.max_seq_len,
-                    max_batch_size=batch_size,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    num_layers=num_layers,
-                    device=self.device,
-                    dtype=self.model.dtype,
+                logger.debug(f"MetalLiger[Qwen3.5]: layer {layer_idx} input_layernorm is Gated — skipped")
+
+        # post_attention_layernorm — plain Qwen3_5RMSNorm in ALL layer types
+        if hasattr(layer, 'post_attention_layernorm'):
+            old_norm = layer.post_attention_layernorm
+            cls_name = type(old_norm).__name__
+            if 'Gated' not in cls_name:  # Safety guard
+                eps = getattr(old_norm, 'variance_epsilon', getattr(old_norm, 'eps', 1e-6))
+                new_norm = MetalLigerRMSNorm(
+                    hidden_size=old_norm.weight.shape[0],
+                    eps=eps,
+                    weight=old_norm.weight.data,
                 )
-                self.shared_cache = cache
-
-            # ── 1. PREFILL PHASE ────────────────────────────────────────────────
-            if verbose: print("Prefilling prompt...")
-            torch.mps.synchronize()
-            t_prefill = time.perf_counter()
-
-            position_ids = None
-            if hasattr(self.model, "get_rope_index"):
-                try:
-                    position_ids, _ = self.model.get_rope_index(
-                        input_ids=inputs.input_ids,
-                        image_grid_thw=inputs.get("image_grid_thw", None),
-                        attention_mask=inputs.get("attention_mask", None),
-                    )
-                except Exception:
-                    position_ids = None
-            elif hasattr(inputs, "position_ids") and inputs.position_ids is not None:
-                position_ids = inputs.position_ids
-
-            if position_ids is not None and "position_ids" not in inputs:
-                inputs["position_ids"] = position_ids
-
-            # ⚡ Unified Slicing Prefill: Slice hidden states before lm_head on vision & text
-            backbone = getattr(self.model, "model", None)
-            lm_head = getattr(self.model, "lm_head", None)
-            executed_fast_prefill = False
-
-            if backbone is not None and lm_head is not None and hasattr(backbone, "forward"):
-                try:
-                    base_out = backbone(
-                        **inputs,
-                        past_key_values=cache,
-                        use_cache=True,
-                        return_dict=True,
-                    )
-                    last_hidden = base_out.last_hidden_state[:, -1:, :]
-                    prefill_logits = lm_head(last_hidden).squeeze(1)
-                    cache = base_out.past_key_values
-                    executed_fast_prefill = True
-                except Exception:
-                    executed_fast_prefill = False
-
-            if not executed_fast_prefill:
-                outputs = self.model(
-                    **inputs,
-                    past_key_values=cache,
-                    use_cache=True,
-                    return_dict=False,
-                )
-                prefill_logits = outputs[0][:, -1, :]
-                cache = outputs[1]
-                del outputs
-
-            next_token = self._sample_token(
-                prefill_logits, temperature=temperature, top_p=top_p, top_k=top_k
-            )
-            del prefill_logits
-
-            output_ids = torch.zeros((batch_size, max_new_tokens), dtype=torch.long, device=self.device)
-            output_ids[:, 0] = next_token.squeeze(-1)
-            num_generated = 1
-
-            cur_position_ids = position_ids[..., -1:] + 1 if position_ids is not None else None
-
-            # Pre-populate static seen mask for zero-sync repetition penalty
-            if repetition_penalty != 1.0:
-                seen_mask = torch.zeros((batch_size, self.vocab_size), dtype=torch.bool, device=self.device)
-                seen_mask.scatter_(1, input_ids, True)
-                seen_mask.scatter_(1, next_token, True)
+                layer.post_attention_layernorm = new_norm
+                count += 1
             else:
-                seen_mask = None
+                logger.debug(f"MetalLiger[Qwen3.5]: layer {layer_idx} post_attention_layernorm is Gated — skipped")
 
-            torch.mps.synchronize()
-            prefill_time = time.perf_counter() - t_prefill
-            prefill_tokens = prompt_len * batch_size
-            prefill_speed = prefill_tokens / prefill_time if prefill_time > 0 else 0.0
-            if verbose:
-                print(f"   Prefill done in {prefill_time:.3f}s ({prefill_speed:.1f} tokens/s, {prefill_tokens} tokens)")
+    # Final language model norm
+    final_norm = _find_final_norm_qwen3_5(model)
+    if final_norm is not None:
+        eps = getattr(final_norm, 'variance_epsilon', getattr(final_norm, 'eps', 1e-6))
+        new_norm = MetalLigerRMSNorm(
+            hidden_size=final_norm.weight.shape[0],
+            eps=eps,
+            weight=final_norm.weight.data,
+        )
+        # Set on correct parent — use safe getattr chains to avoid crashing
+        # when the model hierarchy doesn't match expectations (e.g. Qwen3.5-2B-Base
+        # loaded via AutoModelForImageTextToText has Qwen3_5Model without .model)
+        try:
+            # PEFT + VLM: model.base_model.model.model.language_model.norm
+            peft_lang = getattr(getattr(getattr(getattr(model, 'base_model', None), 'model', None), 'model', None), 'language_model', None)
+            if peft_lang is not None and hasattr(peft_lang, 'norm'):
+                peft_lang.norm = new_norm
+                count += 1
+            # PEFT + bare LLM: model.base_model.model.model.norm
+            elif getattr(getattr(getattr(getattr(model, 'base_model', None), 'model', None), 'model', None), 'norm', None) is not None:
+                model.base_model.model.model.norm = new_norm
+                count += 1
+            # VLM (no PEFT): model.model.language_model.norm
+            elif getattr(getattr(getattr(model, 'model', None), 'language_model', None), 'norm', None) is not None:
+                model.model.language_model.norm = new_norm
+                count += 1
+            # Bare LLM (no PEFT): model.model.norm
+            elif getattr(getattr(model, 'model', None), 'norm', None) is not None:
+                model.model.norm = new_norm
+                count += 1
+            else:
+                logger.debug("MetalLiger[Qwen3.5]: could not find parent for final norm replacement")
+            logger.debug("MetalLiger[Qwen3.5]: final language model norm replaced")
+        except AttributeError as e:
+            logger.debug(f"MetalLiger[Qwen3.5]: could not replace final norm: {e}")
 
-            # ── 2. AUTOREGRESSIVE DECODE PHASE ──────────────────────────────────
-            if verbose: print("⚡ Decoding...")
-            stop_token_ids: set = set()
-            eos_id = self.processor.tokenizer.eos_token_id
-            if eos_id is not None:
-                stop_token_ids.add(eos_id)
-            for tok_str in ["<|im_end|>", "<|endoftext|>"]:
-                tok_id = self.processor.tokenizer.convert_tokens_to_ids(tok_str)
-                if tok_id is not None and tok_id != self.processor.tokenizer.unk_token_id:
-                    stop_token_ids.add(tok_id)
+    return count
 
-            torch.mps.synchronize()
-            t_decode = time.perf_counter()
-            decode_tokens_count = 0
 
-            # ── Asynchronous Pipelined Decode Loop ─────────────────────────────
-            prev_token = next_token
-            for _ in range(max_new_tokens - 1):
-                next_token, cache = self._decode_step(
-                    prev_token, cache,
-                    position_ids=cur_position_ids,
-                    seen_mask=seen_mask,
-                    repetition_penalty=repetition_penalty,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                )
-                if cur_position_ids is not None:
-                    cur_position_ids = cur_position_ids + 1
+def _replace_mlps_qwen3_5(model: nn.Module) -> int:
+    """Replace Qwen3_5MLP with MetalLiger fused SwiGLU in all 24 layers.
 
-                output_ids[:, num_generated] = next_token.squeeze(-1)
-                num_generated += 1
-                decode_tokens_count += 1
+    Both GatedDeltaNet layers and Attention layers share the same
+    Qwen3_5MLP structure (gate_proj + up_proj + down_proj + SiLUActivation),
+    so MetalLigerSwiGLU is a safe drop-in for all of them.
+    """
+    count = 0
+    layers = _find_language_layers_qwen3_5(model)
+    if layers is None:
+        return 0
 
-                token_val = int(prev_token.item())
-                if token_val in stop_token_ids:
-                    num_generated -= 1
-                    decode_tokens_count -= 1
-                    break
-                prev_token = next_token
+    for layer in layers:
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'gate_proj'):
+            layer.mlp = MetalLigerSwiGLU(layer.mlp)
+            count += 1
 
-            if num_generated > 1:
-                last_val = int(next_token.item())
-                if last_val in stop_token_ids:
-                    num_generated -= 1
-                    decode_tokens_count -= 1
+    return count
 
-            torch.mps.synchronize()
-            decode_time = time.perf_counter() - t_decode
-            total_decode_tokens = max(0, decode_tokens_count * batch_size)
-            decode_speed = total_decode_tokens / decode_time if decode_time > 0 else 0.0
-            if verbose:
-                print(f"   Decode done in {decode_time:.3f}s ({decode_speed:.1f} tokens/s, {total_decode_tokens} tokens)")
 
-            final_ids = torch.cat([input_ids, output_ids[:, :num_generated]], dim=1)
-            return self.processor.decode(final_ids[0][prompt_len:], skip_special_tokens=True)
+def apply_metalliger_to_qwen3_5(
+    model: nn.Module,
+    fuse_rms_norm: bool = True,
+    fuse_swiglu: bool = True,
+    fuse_lora: bool = False,   # DISABLED: dynamic lambda-shadowing of q/k/v_proj causes silent
+                               # precision drift and logit erosion during extended training runs.
+                               # Standard PEFT backward is numerically safer. Memory cost: +1.8GB.
+    fuse_flash_attn: bool = False,  # Phase 6: MPS Flash Attention (disabled by default)
+) -> nn.Module:
+    """Apply MetalLiger fused operations to a Qwen3.5 hybrid SSM+Attention model.
 
-        except Exception as e:
-            print(f"   Custom fast-decode encountered an issue ({e}).")
-            print("   Falling back seamlessly to standard generation...")
-            with torch.inference_mode():
-                out_ids = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=(temperature > 1e-5),
-                    temperature=max(temperature, 1e-5) if temperature > 1e-5 else None,
-                    top_p=top_p if temperature > 1e-5 else None,
-                    repetition_penalty=repetition_penalty,
-                )
-            return self.processor.decode(out_ids[0][prompt_len:], skip_special_tokens=True)
+    Supports Qwen/Qwen3.5-2B (and larger variants with the same architecture).
+    Safe to call on both bare models and PEFT-wrapped models.
 
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Run MetalLiger M4 Pro Inference Engine")
-    parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-VL-3B-Instruct", help="Hugging Face model ID or path")
-    parser.add_argument("--prompt", type=str, default="Explain how unified memory architecture works on Apple Silicon in 2 paragraphs.", help="Input text prompt")
-    parser.add_argument("--image", type=str, default=None, help="Optional path to an image file")
-    parser.add_argument("--max-tokens", type=int, default=256, help="Maximum new tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0.0 = greedy)")
-    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling top-p")
-    parser.add_argument("--max-seq-len", type=int, default=2048, help="Maximum total sequence length")
-    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32", "float16"], help="Model weight precision")
-    parser.add_argument("--use-compile", action="store_true", default=False, help="Enable experimental torch.compile")
-    parser.add_argument("--memory-fraction", type=float, default=1.0, help="Fraction of unified memory MPS can allocate")
-    args = parser.parse_args()
+    What is fused:
+      - input_layernorm / post_attention_layernorm in all 24 decoder layers
+        (plain Qwen3_5RMSNorm — NOT the Qwen3_5RMSNormGated inside DeltaNet)
+      - Final language model norm
+      - All 24 Qwen3_5MLP blocks (SwiGLU gate + up fused into one op)
+      - LoRA QKV + MLP backward (if PEFT adapters present)
 
-    engine = InferenceEngine(
-        model_id=args.model_id,
-        max_seq_len=args.max_seq_len,
-        use_compile=args.use_compile,
-        dtype=args.dtype,
-        memory_fraction=args.memory_fraction,
+    What is NOT touched:
+      - Qwen3_5RMSNormGated inside GatedDeltaNet (different gated math)
+      - Vision encoder (LayerNorm + GELU — not RMSNorm)
+      - q_norm / k_norm inside Attention layers (small dim, negligible)
+
+    Args:
+        model: A Qwen3.5 model (Qwen3_5ForConditionalGeneration or PEFT-wrapped)
+        fuse_rms_norm: Replace standard RMSNorm layers (default: True)
+        fuse_swiglu: Replace all Qwen3_5MLP blocks (default: True)
+        fuse_lora: Activate fused LoRA QKV+MLP backward (default: False — disabled for stability)
+
+    Returns:
+        The same model with fused operations applied in-place.
+    """
+    stats = {}
+
+    # Flash Attention patched FIRST (global F.scaled_dot_product_attention)
+    if fuse_flash_attn:
+        success = apply_mps_flash_attention(bf16_backward=True)
+        stats['flash_attn'] = 'active' if success else 'unavailable'
+
+    if fuse_rms_norm:
+        n = _replace_rms_norms_qwen3_5(model)
+        stats['rms_norm'] = n
+        logger.info(
+            f"MetalLiger[Qwen3.5]: replaced {n} RMSNorm layers "
+            "(Qwen3_5RMSNormGated inside DeltaNet intentionally skipped)"
+        )
+
+    if fuse_swiglu:
+        n = _replace_mlps_qwen3_5(model)
+        stats['swiglu'] = n
+        logger.info(f"MetalLiger[Qwen3.5]: replaced {n} MLP layers with fused SwiGLU")
+
+    if fuse_lora:
+        n = patch_fused_lora(model)
+        stats['fused_lora'] = n
+        logger.info(f"MetalLiger[Qwen3.5]: fused LoRA marked {n} modules")
+    else:
+        logger.info(
+            "MetalLiger[Qwen3.5]: fused LoRA DISABLED (default). Using standard PEFT backward "
+            "for numerical stability. Set fuse_lora=True to re-enable (saves ~1.8GB but "
+            "risks precision drift on long runs)."
+        )
+
+    # Phase 7: GatedDeltaNet Precision Hardening
+    n_deltanet = patch_deltanet(model)
+    stats['fused_deltanet'] = n_deltanet
+    logger.info(f"MetalLiger[Qwen3.5]: hardened precision for {n_deltanet} DeltaNet modules")
+
+    total = sum(v for v in stats.values() if isinstance(v, int))
+    logger.info(
+        f"MetalLiger[Qwen3.5]: {total} total layers patched. Details: {stats}"
     )
 
-    images = None
-    if args.image and os.path.exists(args.image):
-        images = [Image.open(args.image).convert("RGB")]
-        print(f"Loaded image: {args.image}")
-
-    print(f"\n--- Generating response for: '{args.prompt}' ---")
-    response = engine.generate(
-        text_prompt=args.prompt,
-        images=images,
-        max_new_tokens=args.max_tokens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        verbose=True,
-    )
-    print("\n--- Output ---")
-    print(response)
+    return model
