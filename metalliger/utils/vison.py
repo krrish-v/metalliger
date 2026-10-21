@@ -62,7 +62,8 @@ class func:
         Detects and configures the default compute device (preferring Apple Silicon 'mps',
         falling back to 'cpu').
         """
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
 
     @staticmethod
     def _load_and_hash_image(
@@ -286,9 +287,6 @@ class func:
             if not store_raw_pil_in_nodes:
                 for p in batch_pils:
                     p.close()
-
-        if self.device.type == "mps":
-            torch.mps.empty_cache()
 
         image_embeddings = np.vstack(embeddings_batches)  # [N, 2048]
         num_nodes = image_embeddings.shape[0]
