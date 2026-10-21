@@ -41,7 +41,6 @@ try:
     from .generation import MetalLigerStaticCache
     from ._torch_library import register_metalliger_ops
     from . import utils
-    from . import util
 except ImportError:
     from metalliger.ops.fused_rms_norm import MetalLigerRMSNorm
     from metalliger.ops.fused_swiglu import MetalLigerSwiGLU
@@ -61,7 +60,6 @@ except ImportError:
     from metalliger._torch_library import register_metalliger_ops
     try:
         from metalliger import utils
-        from metalliger import util
     except ImportError:
         pass
 
@@ -128,4 +126,5 @@ __all__ = [
     "ContiguousGradBuffer",
     # Utilities
     "utils",
+    "util",
 ]
