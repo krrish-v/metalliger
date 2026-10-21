@@ -92,19 +92,18 @@ Tested on Apple Silicon (**M4 Pro**) with `qwen3_vl` (`madrisight/madrimed1.2-VL
 - Apple Silicon Mac (M4 series)
 - Python 3.10+
 
-### 2. Quick One-Line Setup (Terminal)
+### 2. Quick One-Line Setup for flash attention (Terminal)
 ```bash
-pip install -r requirements.txt && git clone https://github.com/mpsops/mps-flash-attention && pip install -e mps-flash-attention && pip install -e .
+git clone https://github.com/mpsops/mps-flash-attention && pip install -e mps-flash-attention && pip install -e .
 ```
 
 ### 3. Step-by-Step Installation
 ```bash
+git clone  https://github.com/krrish-v/metalliger
+
+
 # Install core Python dependencies
 pip install -r requirements.txt
-
-# Install MPS Flash Attention
-git clone https://github.com/mpsops/mps-flash-attention
-pip install -e mps-flash-attention
 
 # Install MetalLiger in editable mode
 pip install -e .
