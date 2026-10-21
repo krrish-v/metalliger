@@ -54,13 +54,22 @@ try:
     from metalliger.ops.fused_deltanet import patch_deltanet, UpcastConv1d
     HAS_LIGER = True
 except ImportError:
-    pass
+    try:
+        from .patch import apply_metalliger_to_qwen3vl
+        from .ops.fused_deltanet import patch_deltanet, UpcastConv1d
+        HAS_LIGER = True
+    except ImportError:
+        pass
 
 try:
     from metalliger.ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
     HAS_FLASH_ATTN = is_mps_flash_attn_available()
 except ImportError:
-    pass
+    try:
+        from .ops.flash_attn import apply_mps_flash_attention, is_mps_flash_attn_available
+        HAS_FLASH_ATTN = is_mps_flash_attn_available()
+    except ImportError:
+        pass
 
 try:
     import fla
