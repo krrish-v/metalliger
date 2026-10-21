@@ -233,3 +233,7 @@ def patch_generator(model: nn.Module, force: bool = False):
     # Monkey-patch
     model.generate = generator.generate
     return model
+
+
+# Backward-compatibility alias
+M4StaticCache = MetalLigerStaticCache
