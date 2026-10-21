@@ -10,7 +10,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.14.0",
-        "torchvision>=0.29.0,
+        "torchvision>=0.29.0",
         "transformers>=5.17.0",
     ],
 )
