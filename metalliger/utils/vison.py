@@ -109,7 +109,7 @@ class func:
                 (int(w * scale), int(h * scale)), Image.Resampling.LANCZOS
             )
 
-        # Deterministic SHA-256 hash for hospital audit & deduplication
+        # Deterministic SHA-256 hash for audit & deduplication
         img_Hash = hashlib.sha256(rgb_img.tobytes()).hexdigest()[:16]
         return rgb_img, img_Hash, source_path
 
@@ -408,7 +408,7 @@ class ClinicalRetrievalResult:
     system_consensus: dict[str, int]
 
 
-# STATEFUL HOSPITAL GRAPH RAG ENGINE (PRE-CACHED & VECTORIZED)
+# STATEFUL GRAPH RAG ENGINE (PRE-CACHED & VECTORIZED)
 
 class UNClinicalGraphRAGEngine:
     """
