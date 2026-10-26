@@ -17,6 +17,10 @@ on a dev split of the queries):
 TRANSDUCTIVE parts: the hub penalty (when fit queries are given), the query-side statistics and the Sinkhorn
 step look at the whole query set. They help on a benchmark where queries and answers are roughly one-to-one,
 and do nothing for a single query. Use `transductive=False` in run_eval.py for a corpus-only number.
+
+FIXES APPLIED FOR LONG CONTEXT:
+1. Added `mean_weight` to `EmbedderConfig` and `PostProcessor` to allow disabling mean pooling (crucial for long docs).
+2. Added `LongContextEmbedder` class that implements document chunking and MaxSim aggregation for search/evaluate.
 """
 from __future__ import annotations
 
@@ -72,6 +76,7 @@ class EmbedderConfig:
     zca_alpha: float = 0.5                  # soft whitening strength (0 = off)
     zca_rank: int = 128                     # size of the subspace that is rescaled
     half_weight: float = 1.0                # weight of the max-pool half relative to the mean-pool half
+    mean_weight: float = 1.0                # weight of the mean-pool half (set to 0.0 to disable mean pooling)
 
     # --- lexical channel -----------------------------------------------------------
     hybrid_weight: float = 0.3              # 0 = dense only (tune_fusion picks the final value)
@@ -219,6 +224,7 @@ class PostProcessor:
         eps: float = 1e-5,
         separate_query_std: bool = False,
         half_weight: float = 1.0,
+        mean_weight: float = 1.0,  # Added mean_weight parameter
     ):
         self.standardize = standardize
         self.remove_pcs = remove_pcs
@@ -227,6 +233,7 @@ class PostProcessor:
         self.eps = eps
         self.separate_query_std = separate_query_std
         self.half_weight = half_weight
+        self.mean_weight = mean_weight
         self.mean_doc: torch.Tensor | None = None
         self.mean_query: torch.Tensor | None = None
         self.std: torch.Tensor | None = None
@@ -290,9 +297,12 @@ class PostProcessor:
                     scale = (self.svals / self.svals[:, -1:].clamp(min=self.eps)).pow(-self.zca_alpha)
                     coef = torch.einsum("nld,ldq->nlq", z, v)
                     z = z + torch.einsum("nlq,ldq->nld", coef * (scale.unsqueeze(0) - 1.0), v)
-        if self.half_weight != 1.0:
+        
+        # Updated to apply mean_weight to the first half (mean-pooled representation)
+        if self.mean_weight != 1.0 or self.half_weight != 1.0:
             half = z.size(-1) // 2
-            z = torch.cat([z[..., :half], z[..., half:] * self.half_weight], dim=-1)
+            z = torch.cat([z[..., :half] * self.mean_weight, z[..., half:] * self.half_weight], dim=-1)
+            
         z = F.normalize(z, p=2, dim=-1)
         return F.normalize(z.mean(dim=1), p=2, dim=-1)
 
@@ -302,12 +312,14 @@ class PostProcessor:
             zca_rank=self.zca_rank, mean_doc=self.mean_doc, mean_query=self.mean_query,
             std=self.std, std_query=self.std_query, v_pcs=self.v_pcs, svals=self.svals,
             separate_query_std=self.separate_query_std, half_weight=self.half_weight,
+            mean_weight=self.mean_weight,
         )
 
     @classmethod
     def from_state(cls, s: dict) -> "PostProcessor":
         p = cls(s["standardize"], s["remove_pcs"], s.get("zca_alpha", 0.5), s.get("zca_rank", 128),
-                separate_query_std=s.get("separate_query_std", False), half_weight=s.get("half_weight", 1.0))
+                separate_query_std=s.get("separate_query_std", False), half_weight=s.get("half_weight", 1.0),
+                mean_weight=s.get("mean_weight", 1.0))
         p.mean_doc, p.mean_query, p.std = s["mean_doc"], s["mean_query"], s["std"]
         p.std_query = s.get("std_query")
         p.v_pcs, p.svals = s.get("v_pcs"), s.get("svals")
@@ -506,7 +518,7 @@ class MedicalTextEmbedder:
     # config fields restored by load_index so a saved index reproduces the tuned pipeline
     _TUNED = (
         "hybrid_weight", "prf_k", "prf_beta", "hub_gamma", "norm_tau", "norm_iters",
-        "standardize", "separate_query_std", "remove_pcs", "zca_alpha", "zca_rank", "half_weight",
+        "standardize", "separate_query_std", "remove_pcs", "zca_alpha", "zca_rank", "half_weight", "mean_weight",
         "bm25_k1", "bm25_b", "lex_bigrams",
     )
     _CFG_KEYS = ("layers", "echo", "sink", "token_zscore", "mask_outlier_tokens", "token_norm", "use_idf")
@@ -765,12 +777,12 @@ class MedicalTextEmbedder:
 
     def refit_post(self, **overrides) -> torch.Tensor:
         """Re-fit the PostProcessor from cached raw states (no LLM calls). Accepts any of
-        standardize / remove_pcs / zca_alpha / zca_rank / separate_query_std / half_weight and stores them
+        standardize / remove_pcs / zca_alpha / zca_rank / separate_query_std / half_weight / mean_weight and stores them
         in the config."""
         if self._raw_docs is None:
             raise RuntimeError("No cached raw embeddings: call index_corpus() first (load_index() does not keep them).")
         cfg = self.config
-        allowed = ("standardize", "remove_pcs", "zca_alpha", "zca_rank", "separate_query_std", "half_weight")
+        allowed = ("standardize", "remove_pcs", "zca_alpha", "zca_rank", "separate_query_std", "half_weight", "mean_weight")
         for k, v in overrides.items():
             if k not in allowed:
                 raise ValueError(f"Unknown post-processing option: {k}")
@@ -778,6 +790,7 @@ class MedicalTextEmbedder:
         self.post = PostProcessor(
             cfg.standardize, cfg.remove_pcs, cfg.zca_alpha, cfg.zca_rank,
             separate_query_std=cfg.separate_query_std, half_weight=cfg.half_weight,
+            mean_weight=cfg.mean_weight,
         ).fit(self._raw_docs, self._raw_fit_q)
         self.corpus_embeddings = self.post.transform(self._raw_docs, "doc")
         self._build_hub()
@@ -907,6 +920,7 @@ class MedicalTextEmbedder:
             remove_pcs=(2, 4, 8),
             zca_alpha=(0.3, 0.5, 0.7),
             half_weight=(0.7, 1.0, 1.4),
+            mean_weight=(0.0, 0.5, 1.0), # Added mean_weight to tuning grid
             separate_query_std=(False, True),
         )
         start = {k: getattr(cfg, k) for k in grid}
@@ -1053,6 +1067,11 @@ class MedicalTextEmbedder:
                 post=self.post.state_dict(),
                 tok_stats={l: {k: (v.cpu() if torch.is_tensor(v) else v) for k, v in s.items()}
                            for l, s in self.tok_stats.items()},
+                # LongContextEmbedder fields
+                original_texts=getattr(self, 'original_texts', None),
+                doc_to_chunks=getattr(self, 'doc_to_chunks', None),
+                chunk_size=getattr(self, 'chunk_size', None),
+                chunk_overlap=getattr(self, 'chunk_overlap', None),
             ),
             path,
         )
@@ -1080,3 +1099,142 @@ class MedicalTextEmbedder:
         self.lex = LexicalIndex(self.corpus_texts, cfg.bm25_k1, cfg.bm25_b, cfg.lex_bigrams)
         self._raw_docs = self._raw_fit_q = None
         self._raw_q = {}
+        
+        # Load LongContextEmbedder fields if they exist
+        self.original_texts = s.get("original_texts")
+        self.doc_to_chunks = s.get("doc_to_chunks")
+        if s.get("chunk_size") is not None:
+            self.chunk_size = s.get("chunk_size")
+        if s.get("chunk_overlap") is not None:
+            self.chunk_overlap = s.get("chunk_overlap")
+
+
+# --------------------------------------------------------------------------- #
+# Long Context Extension
+# --------------------------------------------------------------------------- #
+class LongContextEmbedder(MedicalTextEmbedder):
+    """
+    Extension of MedicalTextEmbedder that handles long documents by chunking them 
+    and using MaxSim aggregation during search and evaluation.
+    """
+    def __init__(self, *args, chunk_size: int = 512, chunk_overlap: int = 64, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.original_texts: list[str] = []
+        self.doc_to_chunks: dict[int, list[int]] = {}
+
+    def index_corpus(self, corpus_texts: Sequence[str], fit_queries: Sequence[str] | None = None, batch_size: int | None = None) -> torch.Tensor:
+        self._validate(corpus_texts)
+        self.original_texts = list(corpus_texts)
+        self.chunk_texts = []
+        self.doc_to_chunks = {}
+        
+        # 1. Chunking logic
+        for doc_idx, text in enumerate(corpus_texts):
+            ids = self.builder.text_ids(text)
+            start = 0
+            doc_chunks = []
+            while start < len(ids):
+                end = min(start + self.chunk_size, len(ids))
+                chunk_ids = ids[start:end]
+                # Decode back to text to feed into the underlying embedder which expects strings
+                chunk_text = self.tokenizer.decode(chunk_ids, skip_special_tokens=True)
+                self.chunk_texts.append(chunk_text)
+                doc_chunks.append(len(self.chunk_texts) - 1)
+                if end == len(ids):
+                    break
+                start += self.chunk_size - self.chunk_overlap
+            self.doc_to_chunks[doc_idx] = doc_chunks
+            
+        # 2. Index the chunks using the parent class
+        return super().index_corpus(self.chunk_texts, fit_queries, batch_size)
+
+    def search(self, query: str, top_k: int = 4) -> list[tuple[float, str]]:
+        chunk_scores = self._score_matrix([query])[0]
+        doc_scores = torch.full((len(self.original_texts),), float('-inf'))
+        
+        # MaxSim: Take the maximum score among all chunks of a document
+        for doc_idx, chunk_indices in self.doc_to_chunks.items():
+            if chunk_indices:
+                doc_scores[doc_idx] = chunk_scores[chunk_indices].max()
+                
+        top_docs = torch.topk(doc_scores, k=min(top_k, len(doc_scores)))
+        return [(float(s), self.original_texts[int(i)]) for s, i in zip(top_docs.values, top_docs.indices)]
+
+    def search_batch(self, queries: Sequence[str], top_k: int = 4) -> list[list[tuple[float, str]]]:
+        if top_k <= 0:
+            raise ValueError("top_k must be positive.")
+        chunk_scores = self._score_matrix(queries)
+        all_results = []
+        for q_idx in range(len(queries)):
+            doc_scores = torch.full((len(self.original_texts),), float('-inf'))
+            for doc_idx, chunk_indices in self.doc_to_chunks.items():
+                if chunk_indices:
+                    doc_scores[doc_idx] = chunk_scores[q_idx, chunk_indices].max()
+            top_docs = torch.topk(doc_scores, k=min(top_k, len(doc_scores)))
+            results = [(float(s), self.original_texts[int(i)]) for s, i in zip(top_docs.values, top_docs.indices)]
+            all_results.append(results)
+        return all_results
+
+    def evaluate(
+        self,
+        queries: Sequence[str],
+        relevant: Sequence[Collection[int]],
+        ks: Sequence[int] = (1, 5, 10),
+        **overrides,
+    ) -> dict:
+        """Metrics of the full current pipeline using MaxSim chunk aggregation."""
+        self._need_index()
+        # Compute the score matrix over chunks, then aggregate to documents
+        chunk_scores = self._score_matrix(queries, **overrides)
+        n_q = len(queries)
+        n_d = len(self.original_texts)
+        doc_scores = torch.full((n_q, n_d), float('-inf'))
+        
+        for doc_idx, chunk_indices in self.doc_to_chunks.items():
+            if chunk_indices:
+                doc_scores[:, doc_idx] = chunk_scores[:, chunk_indices].max(dim=1).values
+                
+        return metrics_from_scores(doc_scores, relevant, ks)
+
+
+# # --------------------------------------------------------------------------- #
+# # Example Usage & Optimal Configuration for Long Context
+# # --------------------------------------------------------------------------- #
+# if __name__ == "__main__":
+#     # Example configuration optimized for long-context medical retrieval
+#     optimal_config = EmbedderConfig(
+#         # 1. Context & Architecture
+#         echo=False,                     # CRITICAL: Disabling echo doubles the effective context window.
+#         layers=(18, 22, 26),            # Deeper layers capture abstract medical semantics better than early layers (4,8,12).
+#         max_text_tokens=8192,           # Increase to match the model's actual context limit.
+#         max_batch_tokens=16384,         # Adjust based on GPU VRAM.
+        
+#         # 2. Pooling & Post-Processing
+#         mean_weight=0.0,                # CRITICAL: Disable mean pooling. Rely purely on Max pooling for long docs.
+#         half_weight=1.0,                # Keep max pooling weight at 1.0.
+#         remove_pcs=0,                   # Do not remove top PCs; top PCs contain vital domain-specific variance.
+#         zca_alpha=0.0,                  # Disable soft whitening.
+#         standardize=True,               # Keep standardization to normalize feature scales.
+#         separate_query_std=True,        # Helpful since queries are short and docs are long.
+        
+#         # 3. Lexical & Fusion
+#         hybrid_weight=0.5,              # CRITICAL: Medical QA relies heavily on exact terminology. Give BM25 50% weight.
+#         bm25_k1=1.5,                    # Slightly higher term frequency saturation for medical keywords.
+#         bm25_b=0.6,                     # Slightly lower length normalization.
+#         lex_bigrams=True,               # Keep bigrams for compound medical terms.
+        
+#         # 4. Refinements (Disable for Long Context)
+#         prf_k=0,                        # Disable Rocchio PRF.
+#         hub_gamma=0.0,                  # Disable CSLS hubness penalty.
+#         norm_tau=0.0,                   # Disable Sinkhorn.
+        
+#         # 5. Token Conditioning
+#         token_zscore=False,             # Disable token z-scoring.
+#         mask_outlier_tokens=False,      # Disable outlier masking (rare medical terms often trigger this!).
+#         token_norm=True                 # L2 normalize tokens.
+#     )
+    
+#     # Initialize the long-context embedder
+#     # embedder = LongContextEmbedder(config=optimal_config, chunk_size=1024, chunk_overlap=128)
