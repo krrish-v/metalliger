@@ -48,9 +48,9 @@ SinkMode = Literal["prepend", "drop", "none"]
 # --------------------------------------------------------------------------- #
 @dataclass
 class EmbedderConfig:
-    model_dir: str = "./saved_qwen3vl_text_embedder"
+    model_dir: str = ""
     pooling: str = "mean_max"               # the only supported pooling (kept for config compatibility)
-    layers: tuple[int, ...] = (8, 18, 8)    # indices into hidden_states
+    layers: tuple[int, ...] = (8, 18, 8)    # indices into hidden_states (0 = embeddings)
     max_text_tokens: int = 2048
     batch_size: int = 4
     max_batch_tokens: int = 8192            # cap on batch_size * padded_len (echo doubles the length)
@@ -72,11 +72,11 @@ class EmbedderConfig:
     # --- document-level post-processing ------------------------------------------
     standardize: bool = True
     separate_query_std: bool = True         # queries are short, docs long: scale queries by their own std
-    remove_pcs: int = 4                     # "all-but-the-top"
+    remove_pcs: int = 0                     # "all-but-the-top"
     zca_alpha: float = 0.5                  # soft whitening strength (0 = off)
     zca_rank: int = 128                     # size of the subspace that is rescaled
-    half_weight: float = 1.0                # weight of the max-pool half relative to the mean-pool half
-    mean_weight: float = 1.0                # weight of the mean-pool half (set to 0.0 to disable mean pooling)
+    half_weight: float = 0.5                # weight of the max-pool half relative to the mean-pool half
+    mean_weight: float = 0.5                # weight of the mean-pool half (set to 0.0 to disable mean pooling)
 
     # --- lexical channel -----------------------------------------------------------
     hybrid_weight: float = 0.3              # 0 = dense only (tune_fusion picks the final value)
