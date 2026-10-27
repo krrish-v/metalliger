@@ -2,7 +2,7 @@
 
 <p align="center">
   <img
-    src="https://raw.githubusercontent.com/krrish-v/metalliger/main/readme_img/metalliger_logo%28generatedbyGemini%29.png"
+    src="https://raw.githubusercontent.com/krrish-v/metalliger/main/readme_img/metalliger_logo(generatedbyGemini).png"
     alt="MetalLiger Logo"
     width="200"
   >
