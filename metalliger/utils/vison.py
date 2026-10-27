@@ -7,43 +7,126 @@ for vision-language tasks using Qwen3-VL models. It includes:
   - Anisotropy correction and CSLS (Cross-Domain Similarity Local Scaling) hubness suppression.
   - Mutual k-NN similarity graph construction.
   - Sparse graph operator precomputation (row-stochastic smoothing matrix and PageRank transition).
-  - Fast cross-modal query-to-image matching (skipping deep Transformer layers for sub-millisecond retrieval).
   - Vectorized Personalized PageRank (PPR) for clinical subgraph retrieval.
+
+QUERY ENCODING is delegated entirely to a text.py `MedicalTextEmbedder` passed as `embedder=`:
+  - the embedder supplies the model, tokenizer, token conditioning (z-score, outlier masking, token norm)
+    and mean pooling; `layers=` picks which hidden states form the query (0 = token embeddings)
+  - only the mean-pooled half of its output is used (image vectors are mean-pooled)
+  - the query side is centred with its own per-layer mean (the image side with the image mean)
+  - stopwords can be dropped from the query, and an optional BM25 channel over node text labels is fused
+  - this module no longer loads or touches a Qwen3VLTextModel / tokenizer itself
 """
 
-import torch
 import hashlib
-from transformers import Qwen3VLVisionModel, AutoProcessor, AutoTokenizer, Qwen3VLTextModel
+import logging
+import re
+import string
+import time
+import unicodedata
+from collections import Counter
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import networkx as nx
+import numpy as np
+import scipy.sparse as sp
+import torch
 import torch.nn.functional as F
 from PIL import Image
-import numpy as np
-import time
-import networkx as nx
-from collections import Counter
-from sklearn.preprocessing import normalize
-from typing import Sequence, Any
-
-import logging
-import os
-from dataclasses import dataclass
-
-import scipy.sparse as sp
+from transformers import AutoProcessor, Qwen3VLVisionModel
 
 # Configure logger for Clinical Graph RAG operations
 logger = logging.getLogger("UNClinicalGraphRAG")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-
 # Default number of neighboring nodes retrieved during Graph RAG traversal
 K_NEIGHBORS = 10
 
-# Special token IDs marking the vision boundaries in Qwen3-VL chat templates
-VISION_START_ID = 151652  # vision start
-VISION_END_ID = 151653    # vision end
-
 # Global engine cache reference for lazy initialization
-_CACHED_ENGINE: Any = None
+_CACHED_ENGINE: "UNClinicalGraphRAGEngine | None" = None
+
+
+# --------------------------------------------------------------------------- #
+# Lexical helpers (same normalisation as the text embedder)
+# --------------------------------------------------------------------------- #
+_STOPWORDS = frozenset(
+    "a an the of in on at to for and or but with without by from as is are was were be been being am "
+    "do does did has have had having it its this that these those what which who whom whose when where "
+    "why how can could should would will may might must shall i you he she we they me my your his her "
+    "our their there here than then so such also about into over under between during after before "
+    "above below up down out off again further once more most other some any each few both very just "
+    "only own same too".split()
+)
+_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
+
+# Generic, label-free imaging phrases used ONLY to estimate the mean token state of the query domain.
+# Pass `fit_queries=` to the engine to use your own domain's phrasing instead / in addition.
+_DEFAULT_CAL_QUERIES = (
+    "Chest X-ray", "CT scan of the brain", "MRI of the knee", "Radiograph of the foot",
+    "Ultrasound of the abdomen", "Mammography of the breast", "Panoramic dental radiograph",
+    "Fundus photograph of the retina", "Dermoscopy of a skin lesion", "Histopathology slide of tissue",
+    "Echocardiogram of the heart", "MRI of the lumbar spine", "Pelvic radiograph",
+    "Abdominal CT with contrast", "Radiograph of the hand", "MRI of the shoulder",
+    "Lung nodule on CT", "Fracture of the wrist", "Whole body bone scan", "PET scan of the body",
+    "Coronary angiography", "Endoscopy image of the stomach", "Ultrasound of the liver",
+    "CT of the kidney", "Thyroid ultrasound", "Brain MRI with tumor", "Pneumonia on chest radiograph",
+    "Radiograph of the ankle", "Cervical spine X-ray", "Retinal OCT scan", "Colonoscopy image",
+    "Prostate MRI",
+)
+
+
+def _s_stem(w: str) -> str:
+    """Harman's S-stemmer: plural stripping only (safe for medical vocabulary)."""
+    n = len(w)
+    if n > 4 and w.endswith("ies") and w[-4] not in "ae":
+        return w[:-3] + "y"
+    if n > 3 and w.endswith("es"):
+        return w[:-1] if w[-3] not in "aeo" else w
+    if n > 3 and w.endswith("s") and w[-2] not in "us":
+        return w[:-1]
+    return w
+
+
+class _NodeLexicalIndex:
+    """Small BM25 index over node text labels (lower-cased, stopword-filtered, S-stemmed, + bigrams)."""
+
+    def __init__(self, texts: Sequence[str | None], k1: float = 1.2, b: float = 0.75):
+        docs = [self.terms(t) if t else [] for t in texts]
+        self.n_docs = len(docs)
+        dl = np.array([max(len(d), 1) for d in docs], dtype=np.float32)
+        avg = float(dl.mean()) if self.n_docs else 1.0
+        by_term: dict[str, list[tuple[int, int]]] = {}
+        for j, d in enumerate(docs):
+            for t, f in Counter(d).items():
+                by_term.setdefault(t, []).append((j, f))
+        self.post: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for t, lst in by_term.items():
+            idx = np.array([j for j, _ in lst], dtype=np.int64)
+            tf = np.array([f for _, f in lst], dtype=np.float32)
+            n = len(lst)
+            idf = np.log(1.0 + (self.n_docs - n + 0.5) / (n + 0.5))
+            norm = k1 * (1.0 - b + b * dl[idx] / avg)
+            self.post[t] = (idx, (idf * tf * (k1 + 1.0) / (tf + norm)).astype(np.float32))
+
+    @staticmethod
+    def terms(text: str) -> list[str]:
+        toks = _TOKEN_RE.findall(unicodedata.normalize("NFKC", str(text)).lower())
+        toks = [_s_stem(t) for t in toks if t not in _STOPWORDS]
+        return toks + [a + "_" + b for a, b in zip(toks, toks[1:])]
+
+    def score(self, query: str) -> np.ndarray:
+        out = np.zeros(self.n_docs, dtype=np.float32)
+        for t in set(self.terms(query)):
+            p = self.post.get(t)
+            if p is not None:
+                out[p[0]] += p[1]
+        return out
+
+
+def _zs(x: np.ndarray) -> np.ndarray:
+    return (x - x.mean()) / max(float(x.std()), 1e-6)
 
 
 class func:
@@ -55,16 +138,6 @@ class func:
     k-NN similarity graphs for retrieval.
     """
 
-    def __init__(self):
-        """
-        Initializes the vision helper utility class.
-
-        Detects and configures the default compute device (preferring Apple Silicon 'mps',
-        falling back to 'cpu').
-        """
-        self.device = device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-
-
     @staticmethod
     def _load_and_hash_image(
         img_input: str | Image.Image, max_edge: int = 512
@@ -72,21 +145,12 @@ class func:
         """
         Loads, resizes, and generates an audit hash for an image input.
 
-        Accepts either a filesystem path / URI or an existing PIL.Image instance.
-        Converts the image to standard RGB, resizes large dimensions using high-quality
-        LANCZOS resampling to cap the vision transformer (ViT) patch count, and computes
-        a deterministic SHA-256 hash prefix for auditing and deduplication.
-
         Args:
             img_input (str | Image.Image): File path string or PIL Image object.
-            max_edge (int, optional): Maximum allowed dimension (width or height) in pixels.
-                Images larger than this will be downscaled preserving aspect ratio. Defaults to 512.
+            max_edge (int, optional): Maximum width/height in pixels (LANCZOS downscale). Defaults to 512.
 
         Returns:
-            tuple[Image.Image, str, str | None]:
-                - rgb_img: Preprocessed PIL Image in RGB mode.
-                - img_Hash: First 16 hex characters of the SHA-256 digest of image bytes.
-                - source_path: Original file path string if provided or accessible, else None.
+            tuple: (rgb_img, first 16 hex chars of the SHA-256 of the resized pixels, source path or None).
 
         Raises:
             TypeError: If img_input is neither a string nor a PIL.Image instance.
@@ -101,17 +165,15 @@ class func:
         else:
             raise TypeError(f"Expected file path or PIL.Image, got {type(img_input)}")
 
-        # Resize large DICOM/PNG exports using LANCZOS to bound ViT patch count
         w, h = rgb_img.size
         if max(w, h) > max_edge:
             scale = max_edge / max(w, h)
             rgb_img = rgb_img.resize(
-                (int(w * scale), int(h * scale)), Image.Resampling.LANCZOS
+                (max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.LANCZOS
             )
 
-        # Deterministic SHA-256 hash for audit & deduplication
-        img_Hash = hashlib.sha256(rgb_img.tobytes()).hexdigest()[:16]
-        return rgb_img, img_Hash, source_path
+        img_hash = hashlib.sha256(rgb_img.tobytes()).hexdigest()[:16]
+        return rgb_img, img_hash, source_path
 
     @torch.inference_mode()
     def encode_images_batch(
@@ -121,52 +183,37 @@ class func:
         pil_images: list[Image.Image],
     ) -> np.ndarray:
         """
-        Encodes a batch of PIL images simultaneously using Qwen3-VL's vision encoder.
-
-        Leverages Qwen3-VL's block-diagonal `image_grid_thw` attention to process a dynamic
-        batch of variable-resolution images in a single forward pass, providing 3.5x-5x speedup
-        over sequential 1-by-1 processing with identical numerical output.
-
-        The sequence of flattened patch embeddings is split per image according to its
-        spatial merge factor (spatial_merge_size^2, default 4), mean-pooled, and L2-normalized.
-
-        Args:
-            image_processor (AutoProcessor): Preprocessor capable of transforming PIL images
-                into pixel values and image_grid_thw tensors.
-            vision_model (Qwen3VLVisionModel): Vision transformer backbone.
-            pil_images (list[Image.Image]): List of RGB PIL Image instances to encode.
+        Encodes a batch of PIL images in ONE forward pass (block-diagonal `image_grid_thw` attention),
+        mean-pools the merged patch embeddings per image and L2-normalises them.
 
         Returns:
-            np.ndarray: L2-normalized image embeddings of shape [batch_size, hidden_dim]
-                (typically [N, 2048]) on CPU.
+            np.ndarray: [batch_size, hidden_dim] float32 on CPU.
         """
+        device = next(vision_model.parameters()).device
         proc = getattr(image_processor, "image_processor", image_processor)
         inputs = proc(images=pil_images, return_tensors="pt")
 
-        pixel_values = inputs["pixel_values"].to(
-            self.device, dtype=vision_model.dtype, non_blocking=True
-        )
-        grid_thw = inputs["image_grid_thw"].to(self.device, non_blocking=True)
+        pixel_values = inputs["pixel_values"].to(device, dtype=vision_model.dtype, non_blocking=True)
+        grid_thw = inputs["image_grid_thw"].to(device, non_blocking=True)
 
-        # Forward pass without dict overhead
-        merged_patches = vision_model(
-            pixel_values, grid_thw=grid_thw, return_dict=False
-        )[1]  # [total_batch_patches, 2048]
+        out = vision_model(pixel_values, grid_thw=grid_thw, return_dict=True)
+        # Newer transformers: ModelOutput with `pooler_output` = merged patches.
+        # Older transformers: tuple whose first element is the merged patches.
+        merged_patches = getattr(out, "pooler_output", None)
+        if merged_patches is None:
+            merged_patches = out[0] if isinstance(out, (tuple, list)) else out.last_hidden_state
 
-        # Split flat patch sequence per image using exact spatial merge factor (2x2 = 4)
         merge_factor = getattr(vision_model, "spatial_merge_size", 2) ** 2
         patches_per_img = (grid_thw.prod(dim=-1) // merge_factor).tolist()
+        if merged_patches.size(0) != sum(patches_per_img):
+            raise RuntimeError(
+                f"Merged patch count {merged_patches.size(0)} != expected {sum(patches_per_img)}; "
+                "the vision model output layout differs from what this helper expects."
+            )
 
         split_patches = torch.split(merged_patches, patches_per_img, dim=0)
-        pooled = torch.stack(
-            [p.mean(dim=0, dtype=torch.float32) for p in split_patches], dim=0
-        )
-
-        normalized = F.normalize(pooled, p=2, dim=-1)
-        result = normalized.cpu().numpy()
-
-        del inputs, pixel_values, grid_thw, merged_patches, split_patches, pooled, normalized
-        return result
+        pooled = torch.stack([p.mean(dim=0, dtype=torch.float32) for p in split_patches], dim=0)
+        return F.normalize(pooled, p=2, dim=-1).cpu().numpy()
 
     def similarity_graph(
         self,
@@ -184,52 +231,28 @@ class func:
         store_raw_pil_in_nodes: bool = False,
     ) -> tuple[nx.Graph, np.ndarray, list[float]]:
         """
-        Constructs an enterprise/clinical-grade similarity graph from an image collection.
+        Builds a mutual-kNN similarity graph from an image collection.
 
-        Full end-to-end pipeline:
-          1. Input validation and filtering of empty/corrupt records.
-          2. Micro-batched GPU/MPS vision embedding extraction via Qwen3-VL ViT.
-          3. Anisotropy calibration (mean-centering) and CSLS (Cross-Domain Similarity Local Scaling)
-             hubness suppression to remove global scanner bias and high-degree hubs.
-          4. Optional hybrid fusion with text embeddings (e.g., anatomical/clinical reports).
-          5. Vectorized mutual k-NN edge construction with cosine similarity thresholding (no O(N^2) Python loops).
-          6. SHA-256 clinical audit hashing and memory-safe NetworkX graph assembly.
+        Pipeline: validation -> micro-batched ViT embedding -> mean-centring + CSLS hubness suppression
+        -> optional fusion with text embeddings -> vectorised (mutual) kNN + cosine threshold -> NetworkX.
 
         Args:
-            images (Sequence[str | Image.Image]): Sequence of image paths or PIL Image instances.
-            image_processor (AutoProcessor): Preprocessor for the vision model.
-            vision_model (Qwen3VLVisionModel): Vision backbone for embedding extraction.
-            texts (Sequence[str | None] | None, optional): Optional clinical text descriptions
-                paired with each image. Defaults to None.
-            text_embeddings (np.ndarray | None, optional): Precomputed text embeddings of shape [N, D]
-                to fuse with visual similarities. Defaults to None.
-            similarity_threshold (float, optional): Minimum cosine similarity required to form an edge.
-                Must be between 0.0 and 1.0. Defaults to 0.85.
-            batch_size (int, optional): Micro-batch size for vision forward passes. Defaults to 16.
-            max_neighbors_k (int, optional): Maximum top-k neighbors considered per node. Defaults to 12.
-            mutual_knn (bool, optional): If True, requires bidirectional top-k membership (i in top_k(j)
-                and j in top_k(i)) to guarantee high homophily and block hub contamination. Defaults to True.
-            calibrate_hubness (bool, optional): If True, applies mean-centering and CSLS penalty
-                to suppress universal hub nodes. Defaults to True.
-            hybrid_text_alpha (float, optional): Weight of text similarity in hybrid fusion
-                ((1 - alpha) * vision_sim + alpha * text_sim). Defaults to 0.35.
-            store_raw_pil_in_nodes (bool, optional): If True, stores PIL Image objects directly in
-                graph node attributes. If False, keeps only string references to minimize RAM. Defaults to False.
+            images: image paths or PIL images.
+            image_processor / vision_model: Qwen3-VL processor and vision tower.
+            texts: optional per-image text labels (stored on nodes, also used for the BM25 channel).
+            text_embeddings: optional [N, D] text embeddings aligned with `images`.
+            similarity_threshold: minimum RAW cosine for an edge (0..1).
+            batch_size: ViT micro-batch size.
+            max_neighbors_k: top-k neighbours considered per node.
+            mutual_knn: require bidirectional top-k membership.
+            calibrate_hubness: mean-centring + CSLS (needs > 10 nodes).
+            hybrid_text_alpha: weight of text similarity when `text_embeddings` is given.
+            store_raw_pil_in_nodes: keep PIL objects on nodes (RAM heavy) instead of path strings.
 
         Returns:
-            tuple[nx.Graph, np.ndarray, list[float]]:
-                - G: Undirected NetworkX Graph with edge weights ('weight' and 'calibrated_affinity')
-                     and node metadata ('image', 'text', 'sha256', 'embedding').
-                - image_embeddings: Normalized NumPy array of shape [N, hidden_dim].
-                - time_to_process: Per-image encoding latency in milliseconds.
-
-        Raises:
-            TypeError: If images is not a list or tuple.
-            ValueError: On empty images, mismatched text/image lengths, or invalid threshold.
+            (G, image_embeddings [N, D], per-image latency in ms)
         """
-        
         # 1. INPUT VALIDATION
-        
         if not isinstance(images, (list, tuple)):
             raise TypeError("`images` must be a list or tuple of PIL Images or file paths.")
         if texts is not None and len(texts) != len(images):
@@ -244,25 +267,22 @@ class func:
             if item is None:
                 logger.warning(f"Skipping index {idx}: image is None.")
                 continue
-            txt = texts[idx] if texts is not None else None
-            valid_records.append((idx, item, txt))
-
+            valid_records.append((idx, item, texts[idx] if texts is not None else None))
         if not valid_records:
             raise ValueError("No valid images were found to process.")
 
-        
         # 2. MICRO-BATCHED VISION EMBEDDING EXTRACTION
         embeddings_batches = []
         time_to_process: list[float] = []
         node_metadata = []
 
         total_valid = len(valid_records)
-        logger.info(f"Encoding {total_valid} medical scans (batch_size={batch_size}) on {self.device}...")
+        dev = next(vision_model.parameters()).device
+        logger.info(f"Encoding {total_valid} medical scans (batch_size={batch_size}) on {dev}...")
 
         for b_start in range(0, total_valid, batch_size):
-            batch_slice = valid_records[b_start : b_start + batch_size]
-            batch_pils = []
-            batch_meta = []
+            batch_slice = valid_records[b_start: b_start + batch_size]
+            batch_pils, batch_meta = [], []
 
             t0 = time.perf_counter()
             for orig_idx, img_item, txt in batch_slice:
@@ -276,57 +296,59 @@ class func:
                 })
 
             batch_embs = self.encode_images_batch(image_processor, vision_model, batch_pils)
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            per_img_ms = round(elapsed_ms / len(batch_pils), 2)
+            per_img_ms = round((time.perf_counter() - t0) * 1000.0 / len(batch_pils), 2)
 
             embeddings_batches.append(batch_embs)
             time_to_process.extend([per_img_ms] * len(batch_pils))
             node_metadata.extend(batch_meta)
 
-            # Free PIL buffers immediately if not storing in RAM
             if not store_raw_pil_in_nodes:
                 for p in batch_pils:
                     p.close()
 
-        image_embeddings = np.vstack(embeddings_batches)  # [N, 2048]
+        image_embeddings = np.vstack(embeddings_batches)
         num_nodes = image_embeddings.shape[0]
 
-        
         # 3. ANISOTROPY CALIBRATION & CSLS HUBNESS SUPPRESSION
-        
-        # Raw cosine similarity matrix (kept in [0, 1] scale for threshold compatibility)
-        raw_sim_matrix = np.dot(image_embeddings, image_embeddings.T)
+        raw_sim_matrix = image_embeddings @ image_embeddings.T
 
         if calibrate_hubness and num_nodes > 10:
-            # Mean-center vectors to remove global scanner bias
             mean_vec = image_embeddings.mean(axis=0, keepdims=True)
             centered = image_embeddings - mean_vec
             cal_embs = centered / np.linalg.norm(centered, axis=1, keepdims=True).clip(min=1e-9)
-            cal_sim = np.dot(cal_embs, cal_embs.T)
-
-            # Cross-Domain Similarity Local Scaling (CSLS) penalty for hub nodes
+            cal_sim = cal_embs @ cal_embs.T
+            # FIX: exclude the self-similarity BEFORE taking the k nearest. The old slice
+            # [-(k+1):-1] of an argpartition is not "the k best without self" (only the pivot is ordered).
+            np.fill_diagonal(cal_sim, -np.inf)
             k_csls = min(10, num_nodes - 1)
-            knn_mean_sim = np.partition(cal_sim, -(k_csls + 1), axis=1)[:, -(k_csls + 1) : -1].mean(axis=1)
+            knn_mean_sim = np.partition(cal_sim, -k_csls, axis=1)[:, -k_csls:].mean(axis=1)
             csls_matrix = cal_sim - 0.5 * (knn_mean_sim[:, None] + knn_mean_sim[None, :])
-            # Blend calibrated topology with raw cosine scale
             topological_affinity = 0.5 * raw_sim_matrix + 0.5 * csls_matrix
         else:
             topological_affinity = raw_sim_matrix.copy()
 
-        # Optional: Fuse Anatomy-Dominant Text Embeddings if provided
-        if text_embeddings is not None and text_embeddings.shape[0] == num_nodes:
-            t_mean = text_embeddings.mean(axis=0, keepdims=True)
-            t_cal = (text_embeddings - t_mean) / np.linalg.norm(text_embeddings - t_mean, axis=1, keepdims=True).clip(min=1e-9)
-            text_sim = np.dot(t_cal, t_cal.T)
-            topological_affinity = (1.0 - hybrid_text_alpha) * topological_affinity + (hybrid_text_alpha * text_sim)
+        # Optional text fusion. FIX: align rows with the surviving nodes (None images were skipped)
+        # and warn instead of silently ignoring a shape mismatch.
+        if text_embeddings is not None:
+            te = np.asarray(text_embeddings, dtype=np.float32)
+            if te.shape[0] == len(images):
+                te = te[[m["orig_idx"] for m in node_metadata]]
+            if te.shape[0] == num_nodes:
+                te_c = te - te.mean(axis=0, keepdims=True)
+                t_cal = te_c / np.linalg.norm(te_c, axis=1, keepdims=True).clip(min=1e-9)
+                text_sim = t_cal @ t_cal.T
+                topological_affinity = (
+                    (1.0 - hybrid_text_alpha) * topological_affinity + hybrid_text_alpha * text_sim
+                )
+            else:
+                logger.warning(
+                    f"text_embeddings has {te.shape[0]} rows for {num_nodes} nodes; text fusion skipped."
+                )
 
-        # Zero out self-loops on the diagonal
         np.fill_diagonal(topological_affinity, -np.inf)
         np.fill_diagonal(raw_sim_matrix, 0.0)
 
-        
         # 4. VECTORIZED MUTUAL k-NN & THRESHOLD GRAPH CONSTRUCTION
-        
         G = nx.Graph()
         for idx, meta in enumerate(node_metadata):
             G.add_node(
@@ -339,34 +361,21 @@ class func:
 
         if num_nodes > 1:
             k_eff = min(max_neighbors_k, num_nodes - 1)
-            # Vectorized O(N) top-k selection per row using argpartition
             top_k_indices = np.argpartition(topological_affinity, -k_eff, axis=1)[:, -k_eff:]
 
-            # Build boolean adjacency mask
             knn_mask = np.zeros((num_nodes, num_nodes), dtype=bool)
-            row_idx = np.arange(num_nodes)[:, None]
-            knn_mask[row_idx, top_k_indices] = True
+            knn_mask[np.arange(num_nodes)[:, None], top_k_indices] = True
 
-            if mutual_knn:
-                # Mutual k-NN: edge (i, j) exists iff i is in top-k of j AND j is in top-k of i
-                # Guarantees high homophily and blocks hub contamination
-                adj_mask = knn_mask & knn_mask.T
-            else:
-                # Symmetric k-NN union
-                adj_mask = knn_mask | knn_mask.T
-
-            # Enforce similarity threshold on upper triangle (i < j)
+            adj_mask = (knn_mask & knn_mask.T) if mutual_knn else (knn_mask | knn_mask.T)
             threshold_mask = raw_sim_matrix >= similarity_threshold
             final_edge_mask = np.triu(adj_mask & threshold_mask, k=1)
 
-            u_indices, v_indices = np.nonzero(final_edge_mask)
-            edge_weights = raw_sim_matrix[u_indices, v_indices]
-            csls_weights = topological_affinity[u_indices, v_indices]
-
-            # Batch-insert edges into NetworkX
+            u_idx, v_idx = np.nonzero(final_edge_mask)
             G.add_edges_from(
                 (int(u), int(v), {"weight": float(w), "calibrated_affinity": float(cw)})
-                for u, v, w, cw in zip(u_indices, v_indices, edge_weights, csls_weights)
+                for u, v, w, cw in zip(
+                    u_idx, v_idx, raw_sim_matrix[u_idx, v_idx], topological_affinity[u_idx, v_idx]
+                )
             )
 
         logger.info(
@@ -381,23 +390,21 @@ class func:
 @dataclass
 class ClinicalRetrievalResult:
     """
-    Structured payload containing clinical Graph RAG retrieval results and audit metrics.
+    Structured payload containing Graph RAG retrieval results and audit metrics.
 
     Attributes:
-        query (str): The natural language query string submitted for retrieval.
-        method (str): Name of the scoring method employed for cross-modal matching.
-        seed_nodes (list[Any]): Top-ranked entry seed node IDs in the knowledge graph.
-        retrieved_subgraph (list[Any]): Complete list of retrieved node IDs (seeds + ranked neighbors).
-        smoothed_sims (np.ndarray): 1D array of 1-hop smoothed similarity scores across all graph nodes.
-        ppr_scores (dict[Any, float]): Personalized PageRank stationary distribution mapped by node ID.
-        confidence_z_score (float): Statistical confidence metric ((top_score - mean) / std).
-        is_low_confidence_warning (bool): Flag indicating if confidence_z_score is below threshold.
-        latency_ms (float): Total end-to-end retrieval latency in milliseconds.
-        system_consensus (dict[str, int]): Frequency distribution of anatomical/clinical labels
-            across retrieved nodes.
+        query: the submitted query.
+        seed_nodes: top-ranked entry node IDs.
+        retrieved_subgraph: seeds + ranked neighbours.
+        smoothed_sims: 1-hop smoothed scores over all nodes (cosine scale; z-scale if the lexical channel fired).
+        ppr_scores: Personalized PageRank mass per node.
+        confidence_z_score: (top - mean) / std of `smoothed_sims`.
+        is_low_confidence_warning: z below threshold (only when the threshold is attainable for this graph size).
+        latency_ms: end-to-end retrieval latency.
+        system_consensus: label frequency across retrieved nodes.
+        lexical_weight_used: BM25 fusion weight actually applied (0.0 = dense only).
     """
     query: str
-    method: str
     seed_nodes: list[Any]
     retrieved_subgraph: list[Any]
     smoothed_sims: np.ndarray
@@ -406,189 +413,143 @@ class ClinicalRetrievalResult:
     is_low_confidence_warning: bool
     latency_ms: float
     system_consensus: dict[str, int]
+    lexical_weight_used: float = 0.0
 
 
 # STATEFUL GRAPH RAG ENGINE (PRE-CACHED & VECTORIZED)
 
 class UNClinicalGraphRAGEngine:
     """
-    High-throughput, memory-safe cross-modal Graph RAG engine for clinical decision support.
+    Cross-modal Graph RAG engine whose query side is a text.py `MedicalTextEmbedder`.
 
     Pre-computes and caches:
-      - Mean-centered, L2-normalized image embeddings resident on target accelerator (MPS/CUDA/CPU).
-      - CSR sparse row-stochastic smoothing matrix (P = D^-1 * A) for sub-millisecond 1-hop diffusion.
-      - Transposed transition matrix (P^T) for vectorized power-iteration Personalized PageRank.
-      - Static chat boundary token IDs (<|im_start|>, <|vision_start|>, <|vision_end|>, <|im_end|>).
-
-    Supports fast sub-millisecond query scoring by evaluating only Layer 0 (token embeddings)
-    or early transformer blocks rather than evaluating all 28 LLM layers.
+      - (optionally mean-centred) L2-normalised image embeddings on the embedder's device,
+      - CSR row-stochastic smoothing matrix P = D^-1 A and its transpose for power-iteration PPR,
+      - per-layer mean query vector (text-side centring) and per-layer token statistics in the embedder,
+      - an optional BM25 index over node text labels.
     """
 
     def __init__(
         self,
         G: nx.Graph,
-        text_model: torch.nn.Module,
-        tokenizer: Any,
+        embedder: Any,
         device: str | torch.device | None = None,
-        image_dir: str = "./medmax_data/images_/",
         fallback_embs: np.ndarray | None = None,
         confidence_z_threshold: float = 2.0,
+        fit_queries: Sequence[str] | None = None,
+        layers: Sequence[int] = (0, 1),
+        layer_weights: Sequence[float] | None = None,
+        query_center: bool = True,
+        drop_stopwords: bool = True,
+        lexical_weight: float = 0.3,
+        center_images: bool | None = None,
+        min_nodes_for_centering: int = 8,
     ):
         """
-        Initializes the Clinical Graph RAG Engine.
-
         Args:
-            G (nx.Graph): Pre-constructed knowledge graph containing image nodes and metadata.
-            text_model (torch.nn.Module): Language model backbone (e.g. Qwen3VLTextModel).
-            tokenizer (Any): Model tokenizer for encoding text queries.
-            device (str | torch.device | None, optional): Target compute device. Defaults to text_model's device.
-            image_dir (str, optional): Base directory for resolving relative image paths.
-                Defaults to "./medmax_data/images_/".
-            fallback_embs (np.ndarray | None, optional): Fallback embedding matrix of shape [N, D] if
-                node attributes lack embeddings. Defaults to None.
-            confidence_z_threshold (float, optional): Z-score threshold below which a low-confidence
-                warning is triggered. Defaults to 2.0.
+            G: knowledge graph (nodes carry 'embedding' and optionally 'text').
+            embedder: a text.py `MedicalTextEmbedder` (provides model, tokenizer and token conditioning).
+            device: compute device for scoring (default: the embedder model's device).
+            fallback_embs: used when nodes lack an 'embedding' attribute.
+            confidence_z_threshold: z-score under which a low-confidence warning is raised.
+            fit_queries: optional unlabeled example queries of YOUR domain, used only for calibration
+                (token statistics and the mean query vector). Built-in generic imaging phrases are always added.
+            layers: hidden-state indices used for the query (0 = token embeddings, negatives allowed).
+            layer_weights: optional weight per entry of `layers` (default: uniform).
+            query_center: subtract the per-layer mean query vector (set False to A/B test).
+            drop_stopwords: remove stopwords from the query before encoding.
+            lexical_weight: BM25 fusion weight when >= 50% of nodes have text labels (0 = off).
+            center_images: mean-centre image embeddings. None = auto (only if num_nodes >= min_nodes_for_centering).
+            min_nodes_for_centering: see above.
 
         Raises:
-            ValueError: If graph G has zero nodes or embeddings cannot be resolved.
+            ValueError: empty graph, missing embedder, embedding-size mismatch, or unresolvable embeddings.
         """
         if G.number_of_nodes() == 0:
             raise ValueError("Graph G contains no nodes.")
+        if embedder is None:
+            raise ValueError("`embedder` (a text.py MedicalTextEmbedder) is required.")
 
         self.G = G
-        self.text_model = text_model
-        self.tokenizer = tokenizer
-        self.image_dir = image_dir
+        self.embedder = embedder
         self.confidence_z_threshold = confidence_z_threshold
+        self.query_center = query_center
+        self.drop_stopwords = drop_stopwords
+        self.lexical_weight = lexical_weight
+        self.text_layers = tuple(layers)
+        self._cache_key: tuple | None = None
 
-        if device is None:
-            self.device = next(text_model.parameters()).device
-        else:
-            self.device = torch.device(device)
+        self.device = torch.device(embedder.model.device) if device is None else torch.device(device)
 
-        # 1. Build safe Node-ID <-> Contiguous Array Index mappings
+        # 1. Node-ID <-> contiguous index mappings
         self.node_list: list[Any] = list(G.nodes())
         self.num_nodes: int = len(self.node_list)
-        self.node_to_idx: dict[Any, int] = {
-            node_id: idx for idx, node_id in enumerate(self.node_list)
-        }
+        self.node_to_idx: dict[Any, int] = {n: i for i, n in enumerate(self.node_list)}
 
-        # 2. Extract and calibrate image embeddings ONCE
+        # 2. Image embeddings, calibrated ONCE
         raw_embs = self._extract_aligned_embeddings(fallback_embs)
-        self.cal_img_np, self.img_mean_np = self.calibrate_image_embeddings(raw_embs)
+        do_center = (self.num_nodes >= min_nodes_for_centering) if center_images is None else center_images
+        if not do_center:
+            logger.info(
+                f"Image mean-centring skipped ({self.num_nodes} nodes < {min_nodes_for_centering}); "
+                "the mean of so few images would erase their differences."
+            )
+        self.cal_img_np = self.calibrate_image_embeddings(raw_embs, center=do_center)
+        self.cal_img_tensor = torch.as_tensor(self.cal_img_np, dtype=torch.float32, device=self.device)
 
-        # Keep calibrated embeddings resident on target accelerator (MPS/CUDA/CPU)
-        self.cal_img_tensor = torch.as_tensor(
-            self.cal_img_np, dtype=torch.float32, device=self.device
-        )
+        # 3. Query-side calibration through the embedder, ONCE
+        self.emb_layer_mean: torch.Tensor | None = None
+        self.layer_w: torch.Tensor | None = None
+        self._init_embedder_path(fit_queries, layer_weights)
 
-        # 3. Pre-tokenize static chat boundary markers ONCE
-        self.sprefix_ids: list[int] = self.tokenizer.encode(
-            "<|im_start|>", add_special_tokens=False
-        )
-        self.nprefix_ids: list[int] = self.tokenizer.encode(
-            "<|im_end|>", add_special_tokens=False
-        )
-
-        # 4. Precompute sparse row-normalized adjacency & PageRank transition matrices ONCE
+        # 4. Sparse graph operators ONCE
         self._build_sparse_graph_operators()
 
-        # 5. Register scoring methods
-        self.methods_registry = {
-            "1_layer0_boundary_pro": self.score_medmax_chat_aligned,
-            "balanced_vision_boundary": self.score_medmax_chat_aligned,
-            "fast_layer0_static": lambda q: self.score_medmax_chat_aligned(
-                q, layer0_weight=1.0
-            ),
-            "hybrid_blended_context": lambda q: self.score_medmax_chat_aligned(
-                q, layer0_weight=0.80
-            ),
-        }
+        # 5. Optional lexical channel over node text labels
+        self.lex: _NodeLexicalIndex | None = None
+        labels = [self.G.nodes[n].get("text") for n in self.node_list]
+        labels = [str(t) if t else None for t in labels]
+        if lexical_weight > 0 and sum(t is not None for t in labels) >= 0.5 * self.num_nodes:
+            self.lex = _NodeLexicalIndex(labels)
 
-    def _extract_aligned_embeddings(
-        self, fallback_embs: np.ndarray | None
-    ) -> np.ndarray:
-        """
-        Extracts image embeddings aligned with self.node_list.
-
-        Attempts to retrieve embeddings from node attributes in graph G first.
-        If absent, validates and slices from fallback_embs.
-
-        Args:
-            fallback_embs (np.ndarray | None): Fallback 2D embedding array.
-
-        Returns:
-            np.ndarray: Float32 array of shape [num_nodes, embedding_dim].
-
-        Raises:
-            ValueError: If embeddings cannot be found in node attributes or fallback_embs.
-        """
-        first_node = self.node_list[0]
-        if "embedding" in self.G.nodes[first_node]:
-            return np.vstack(
-                [self.G.nodes[n]["embedding"] for n in self.node_list]
-            ).astype(np.float32)
+    # ------------------------------------------------------------------ #
+    # Setup helpers
+    # ------------------------------------------------------------------ #
+    def _extract_aligned_embeddings(self, fallback_embs: np.ndarray | None) -> np.ndarray:
+        """Image embeddings aligned with self.node_list (node attributes first, then fallback_embs)."""
+        if all("embedding" in self.G.nodes[n] for n in self.node_list):
+            return np.vstack([self.G.nodes[n]["embedding"] for n in self.node_list]).astype(np.float32)
         if fallback_embs is not None:
             if fallback_embs.shape[0] < self.num_nodes:
                 raise ValueError(
-                    f"fallback_embs has {fallback_embs.shape[0]} rows, "
-                    f"but Graph G has {self.num_nodes} nodes."
+                    f"fallback_embs has {fallback_embs.shape[0]} rows, but Graph G has {self.num_nodes} nodes."
                 )
             return np.asarray(fallback_embs[: self.num_nodes], dtype=np.float32)
         raise ValueError("No embeddings found in G node attributes or fallback_embs.")
 
     @staticmethod
     def calibrate_image_embeddings(
-        img_embs: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """
-        Mean-centers and L2-normalizes image embeddings to mitigate visual anisotropy.
-
-        Removes the shared common vector (e.g., scanner background, modality bias)
-        and projects all vectors onto the unit hypersphere.
-
-        Args:
-            img_embs (np.ndarray): 2D float array of raw embeddings [N, D].
-
-        Returns:
-            tuple[np.ndarray, np.ndarray]:
-                - cal_img: Calibrated and unit-normalized embeddings of shape [N, D].
-                - img_mean: 1x D mean vector subtracted during centering.
-
-        Raises:
-            ValueError: If img_embs is not a non-empty 2D array.
-        """
+        img_embs: np.ndarray, center: bool = True
+    ) -> np.ndarray:
+        """Mean-centres (optional) and L2-normalises image embeddings. Returns [N, D]."""
         if img_embs.ndim != 2 or img_embs.shape[0] == 0:
             raise ValueError("img_embs must be a non-empty 2D array.")
-
         img_embs = np.asarray(img_embs, dtype=np.float32)
-        img_mean = img_embs.mean(axis=0, keepdims=True)
+        img_mean = img_embs.mean(axis=0, keepdims=True) if center else np.zeros((1, img_embs.shape[1]), np.float32)
         centered = img_embs - img_mean
         norms = np.linalg.norm(centered, axis=1, keepdims=True)
-        cal_img = centered / np.clip(norms, 1e-9, None)
-        return cal_img, img_mean
+        return centered / np.clip(norms, 1e-9, None)
 
     def _build_sparse_graph_operators(self) -> None:
-        """
-        Constructs CSR sparse matrices for graph signal smoothing and Personalized PageRank.
-
-        Computes:
-          - Degree-normalized row-stochastic adjacency matrix P = D^-1 * A for 1-hop smoothing.
-          - Transposed transition operator P^T for fast power-iteration PPR.
-          - Dangling node bitmask for nodes with zero out-degree.
-        """
+        """CSR smoothing matrix P = D^-1 A, its transpose for PPR, and dangling/has-neighbour masks."""
         if self.G.number_of_edges() == 0:
-            self.smoothing_matrix = sp.csr_matrix(
-                (self.num_nodes, self.num_nodes), dtype=np.float32
-            )
-            self.ppr_transition_T = sp.csr_matrix(
-                (self.num_nodes, self.num_nodes), dtype=np.float32
-            )
+            empty = sp.csr_matrix((self.num_nodes, self.num_nodes), dtype=np.float32)
+            self.smoothing_matrix = empty
+            self.ppr_transition_T = empty
             self.dangling_mask = np.ones(self.num_nodes, dtype=bool)
             self.has_neighbors_mask = np.zeros(self.num_nodes, dtype=bool)
             return
 
-        # Extract weighted adjacency matrix aligned to self.node_list
         adj = nx.to_scipy_sparse_array(
             self.G, nodelist=self.node_list, weight="weight", format="csr", dtype=np.float32
         )
@@ -599,161 +560,118 @@ class UNClinicalGraphRAGEngine:
         inv_deg = np.zeros_like(row_sums, dtype=np.float32)
         inv_deg[self.has_neighbors_mask] = 1.0 / row_sums[self.has_neighbors_mask]
 
-        # Row-stochastic transition matrix P = D^-1 * A
         P = sp.diags(inv_deg) @ adj
         self.smoothing_matrix = P.tocsr()
-        # Transpose P^T for fast power-iteration PageRank
         self.ppr_transition_T = P.T.tocsr()
 
-    def get_node_image_info(self, node_id: Any) -> tuple[str, str, str]:
-        """
-        Resolves display name, full filesystem path, and clinical label for a given node.
-
-        Handles multiple metadata naming conventions ('text', 'body_system', 'image', 'path').
-
-        Args:
-            node_id (Any): Unique identifier of the node in graph G.
-
-        Returns:
-            tuple[str, str, str]:
-                - img_rel: Relative image filename or identifier.
-                - full_path: Absolute or resolved path on disk.
-                - label_str: Clinical/anatomical category or text description.
-        """
+    def get_node_image_info(self, node_id: Any) -> tuple[str, str]:
+        """Resolves (image name, label) for a node."""
         node_data = self.G.nodes[node_id]
-        # Support both `text` and `body_system` metadata keys
         label = node_data.get("text")
         if label is None:
             label = node_data.get("body_system", "Unknown")
-        label_str = str(label)
 
         raw_img = node_data.get("image", node_data.get("path", None))
         if isinstance(raw_img, (list, tuple)) and len(raw_img) > 0:
-            img_rel = str(raw_img[0])
+            img_name = str(raw_img[0])
         elif isinstance(raw_img, str):
-            img_rel = raw_img
+            img_name = raw_img
         else:
-            img_rel = f"node_{node_id}"
+            img_name = f"node_{node_id}"
+        return img_name, str(label)
 
-        if os.path.isabs(img_rel) or img_rel.startswith(self.image_dir):
-            full_path = img_rel
-        else:
-            full_path = os.path.join(self.image_dir, img_rel)
-
-        return img_rel, full_path, label_str
+    # ------------------------------------------------------------------ #
+    # Query encoding through the text.py MedicalTextEmbedder
+    # ------------------------------------------------------------------ #
+    def _prep_query(self, query: str) -> str:
+        """NFKC-normalise and (optionally) drop stopwords, keeping the query if nothing else is left."""
+        norm = " ".join(unicodedata.normalize("NFKC", str(query)).split())
+        if not norm:
+            raise ValueError("Query must not be empty.")
+        if self.drop_stopwords:
+            words = norm.split()
+            kept = [w for w in words if w.lower().strip(string.punctuation) not in _STOPWORDS]
+            norm = " ".join(kept or words)
+        return norm
 
     @torch.inference_mode()
-    def _encode_layer0_and_layer1_only(
-        self, input_ids: torch.Tensor, attn_mask: torch.Tensor, need_layer1: bool
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Executes truncated forward pass for ultra-fast text representation.
-
-        When `need_layer1=False`, executes only the token embedding layer (`embed_tokens`),
-        taking < 0.2ms. When `need_layer1=True`, executes Layer 0 + Layer 1, bypassing
-        the remaining 27 deep transformer layers.
-
-        Args:
-            input_ids (torch.Tensor): Token ID tensor of shape [1, seq_len].
-            attn_mask (torch.Tensor): Attention mask tensor of shape [1, seq_len].
-            need_layer1 (bool): Whether to compute the first transformer layer hidden states.
-
-        Returns:
-            tuple[torch.Tensor, torch.Tensor | None]:
-                - layer0: Token embeddings of shape [1, seq_len, hidden_dim].
-                - layer1: Hidden states from layer 1, or None if need_layer1 is False.
-        """
-        layer0 = self.text_model.embed_tokens(input_ids)
-        if not need_layer1:
-            return layer0, None
-
-        # Run full forward if custom hooks are needed, or use fast 1st-layer path
-        pos_1d = (attn_mask.long().cumsum(-1) - 1).masked_fill(attn_mask == 0, 1)
-        pos_3d = pos_1d.unsqueeze(0).expand(3, -1, -1)
-
-        outputs = self.text_model(
-            input_ids=input_ids,
-            attention_mask=attn_mask,
-            position_ids=pos_3d,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-        return layer0, outputs.hidden_states[1]
+    def _embedder_raw(self, texts: Sequence[str]) -> torch.Tensor:
+        """[n, L, D] mean-pooled states (first half of `encode_raw`) for `self.text_layers`."""
+        cfg = self.embedder.config
+        old = cfg.layers
+        cfg.layers = self.text_layers
+        try:
+            raw = self.embedder.encode_raw(list(texts), "query")
+        finally:
+            cfg.layers = old
+        d = self.embedder.model.config.hidden_size
+        return raw[:, :, :d].float().to(self.device)   # image vectors are mean-pooled: drop the max half
 
     @torch.inference_mode()
-    def score_medmax_chat_aligned(
-        self,
-        query: str,
-        layer0_weight: float = 0.80,
-    ) -> np.ndarray:
-        """
-        Computes cross-modal query-to-image cosine similarities against cached embeddings.
+    def _init_embedder_path(self, fit_queries: Sequence[str] | None, layer_weights: Sequence[float] | None) -> None:
+        """Validates dims/layers, calibrates token stats for layers the embedder has not seen, and estimates
+        the per-layer mean query vector (text-side centring)."""
+        emb = self.embedder
+        d_text, d_img = emb.model.config.hidden_size, self.cal_img_tensor.shape[-1]
+        if d_text != d_img:
+            raise ValueError(f"Embedder hidden size {d_text} != image embedding size {d_img}.")
+        self.text_layers = tuple(emb._norm_layers(self.text_layers))
 
-        Wraps the query in MedMax / Qwen3-VL chat boundary format:
-          `<|im_start|><|vision_start|> {query} <|vision_end|><|im_end|>`
-        Extracts pooled token representations from the query tokens, L2-normalizes, and
-        computes GPU/accelerator GEMM against resident image embeddings.
+        if layer_weights is None:
+            w = torch.ones(len(self.text_layers))
+        else:
+            if len(layer_weights) != len(self.text_layers):
+                raise ValueError("`layer_weights` must have one entry per layer in `layers`.")
+            w = torch.as_tensor(list(layer_weights), dtype=torch.float32)
+            if (w < 0).any() or w.sum() <= 0:
+                raise ValueError("`layer_weights` must be non-negative with a positive sum.")
+        self.layer_w = (w / w.sum()).to(self.device)
 
-        Args:
-            query (str): Clinical question or text prompt.
-            layer0_weight (float, optional): Weight given to Layer 0 embeddings versus Layer 1.
-                When set to 1.0, skips the Transformer forward pass entirely. Defaults to 0.80.
+        cal: list[str] = []
+        for t in dict.fromkeys(list(fit_queries or []) + list(_DEFAULT_CAL_QUERIES)):
+            try:
+                cal.append(self._prep_query(t))
+            except ValueError:
+                continue
+        cal = list(dict.fromkeys(cal))
 
-        Returns:
-            np.ndarray: 1D array of cosine similarity scores of length `num_nodes` on CPU.
+        cfg = emb.config
+        missing = [l for l in self.text_layers if l not in emb.tok_stats]
+        if missing and (cfg.token_zscore or cfg.mask_outlier_tokens):
+            old = cfg.layers
+            cfg.layers = tuple(missing)
+            try:
+                emb.calibrate(cal)
+            finally:
+                cfg.layers = old
+        if self.query_center:
+            self.emb_layer_mean = self._embedder_raw(cal).mean(dim=0)   # [L, D]
 
-        Raises:
-            ValueError: On empty query, invalid weight, or embedding dimension mismatch.
-        """
+    @torch.inference_mode()
+    def score_with_embedder(self, query: str) -> np.ndarray:
+        """Cosine similarity of the embedder-encoded query (selected layers, weighted) to every image."""
         if not query or not query.strip():
             raise ValueError("Query must not be empty.")
-        if not 0.0 <= layer0_weight <= 1.0:
-            raise ValueError("layer0_weight must be between 0.0 and 1.0.")
+        z = self._embedder_raw([self._prep_query(query)])[0]        # [L, D]
+        if self.emb_layer_mean is not None:
+            z = z - self.emb_layer_mean
+        z = F.normalize(z, p=2, dim=-1)
+        q_vec = F.normalize((z * self.layer_w.unsqueeze(-1)).sum(dim=0, keepdim=True), p=2, dim=-1)
+        scores = q_vec.to(self.cal_img_tensor.dtype) @ self.cal_img_tensor.T
+        return scores.squeeze(0).float().cpu().numpy()
 
-        core_ids = self.tokenizer.encode(query.strip(), add_special_tokens=False)
-        if not core_ids:
-            raise ValueError(f"Query '{query}' produced no valid tokens.")
+    def _fuse_lexical(self, query: str, dense: np.ndarray, w: float) -> tuple[np.ndarray, float]:
+        """(1-w) * z(dense) + w * z(BM25 over node labels). No-op when there is no lexical signal."""
+        if self.lex is None or w <= 0.0:
+            return dense, 0.0
+        lex = self.lex.score(query)
+        if lex.max() <= 0.0:
+            return dense, 0.0
+        return (1.0 - w) * _zs(dense) + w * _zs(lex), w
 
-        full_ids = (
-            self.sprefix_ids
-            + [VISION_START_ID]
-            + core_ids
-            + [VISION_END_ID]
-            + self.nprefix_ids
-        )
-        start_idx = len(self.sprefix_ids) + 1
-        end_idx = start_idx + len(core_ids)
-
-        input_ids = torch.tensor([full_ids], dtype=torch.long, device=self.device)
-        attn_mask = torch.ones_like(input_ids)
-
-        need_layer1 = layer0_weight < 1.0 - 1e-6
-        layer0, layer1 = self._encode_layer0_and_layer1_only(
-            input_ids, attn_mask, need_layer1=need_layer1
-        )
-
-        inner_layer0 = layer0[:, start_idx:end_idx, :].mean(dim=1)
-        e0 = F.normalize(inner_layer0, p=2, dim=-1)
-
-        if need_layer1 and layer1 is not None:
-            inner_layer1 = layer1[:, start_idx:end_idx, :].mean(dim=1)
-            e1 = F.normalize(inner_layer1, p=2, dim=-1)
-            q_vec = F.normalize(
-                layer0_weight * e0 + (1.0 - layer0_weight) * e1, p=2, dim=-1
-            )
-        else:
-            q_vec = e0
-
-        if q_vec.shape[-1] != self.cal_img_tensor.shape[-1]:
-            raise ValueError(
-                f"Embedding dimension mismatch: query={q_vec.shape[-1]}, "
-                f"images={self.cal_img_tensor.shape[-1]}"
-            )
-
-        # Fast matrix-vector multiplication on MPS/CUDA
-        scores = q_vec @ self.cal_img_tensor.T
-        return scores.squeeze(0).cpu().numpy()
-
+    # ------------------------------------------------------------------ #
+    # Graph retrieval
+    # ------------------------------------------------------------------ #
     def _fast_personalized_pagerank(
         self,
         personalization_vec: np.ndarray,
@@ -761,93 +679,51 @@ class UNClinicalGraphRAGEngine:
         tol: float = 1e-6,
         max_iter: int = 100,
     ) -> dict[Any, float]:
-        """
-        Vectorized CSR power-iteration Personalized PageRank (PPR).
-
-        Solves the stationary distribution x = alpha * (P^T x + dangling * p) + (1 - alpha) * p
-        in compressed sparse format, matching `nx.pagerank` within 1e-6 tolerance in < 0.5 ms.
-
-        Args:
-            personalization_vec (np.ndarray): Preference/teleportation vector over all nodes.
-            alpha (float, optional): Damping/random walk restart factor. Defaults to 0.85.
-            tol (float, optional): L1 convergence tolerance threshold. Defaults to 1e-6.
-            max_iter (int, optional): Maximum power-iteration steps. Defaults to 100.
-
-        Returns:
-            dict[Any, float]: Mapping from node ID to stationary Personalized PageRank score.
-        """
+        """Power-iteration Personalized PageRank on the cached CSR transition matrix."""
         p = personalization_vec / np.clip(personalization_vec.sum(), 1e-12, None)
         x = p.copy()
-
         for _ in range(max_iter):
             x_last = x
             dangling_sum = x[self.dangling_mask].sum()
-            x = (
-                alpha * (self.ppr_transition_T @ x + dangling_sum * p)
-                + (1.0 - alpha) * p
-            )
+            x = alpha * (self.ppr_transition_T @ x + dangling_sum * p) + (1.0 - alpha) * p
             if np.abs(x - x_last).sum() < self.num_nodes * tol:
                 break
-
         return {self.node_list[i]: float(x[i]) for i in range(self.num_nodes)}
 
     def query(
         self,
         text_query: str,
-        method: str = "1_layer0_boundary_pro",
         top_k_seeds: int = 1,
         k_neighbors: int = K_NEIGHBORS,
         smoothing_lambda: float = 0.40,
         verbose: bool = True,
     ) -> ClinicalRetrievalResult:
         """
-        Executes full Clinical Graph RAG retrieval pipeline with confidence auditing.
-
-        Steps:
-          1. Cross-modal similarity scoring against pre-calibrated accelerator embeddings.
-          2. 1-Hop Graph Signal Smoothing via sparse matrix-vector multiplication (O(|E|)).
-          3. Seed selection and clinical confidence Z-score calculation ((max - mean) / std).
-          4. Vectorized Personalized PageRank (PPR) rooted on exponential similarity distribution.
-          5. Homophily-weighted neighbor ranking and clinical consensus aggregation.
+        Full retrieval: embedder scoring -> (BM25 fusion) -> 1-hop smoothing -> seeds + confidence
+        -> PPR -> ranked neighbours.
 
         Args:
-            text_query (str): Clinical query or diagnostic symptom description.
-            method (str, optional): Scoring method key registered in methods_registry.
-                Defaults to "1_layer0_boundary_pro".
-            top_k_seeds (int, optional): Number of top entry seed nodes to select. Defaults to 1.
-            k_neighbors (int, optional): Maximum number of neighboring nodes to retrieve. Defaults to 10.
-            smoothing_lambda (float, optional): Weight of neighborhood smoothing (0.0 = no smoothing).
-                Defaults to 0.40.
-            verbose (bool, optional): Whether to log clinical audit output to stdout. Defaults to True.
-
-        Returns:
-            ClinicalRetrievalResult: Structured retrieval payload with seeds, subgraph, scores,
-                PPR values, confidence Z-score, and latency metrics.
-
-        Raises:
-            ValueError: If the specified scoring method is not registered.
+            text_query: query string.
+            top_k_seeds: number of entry seeds.
+            k_neighbors: max neighbours returned.
+            smoothing_lambda: weight of neighbourhood smoothing (0 = off).
+            verbose: print the audit table.
         """
         t0 = time.perf_counter()
 
-        if method not in self.methods_registry:
-            raise ValueError(
-                f"Unknown method '{method}'. Available: {list(self.methods_registry.keys())}"
-            )
+        # Step A: cross-modal similarity (+ optional lexical fusion over node labels)
+        raw_sims = self.score_with_embedder(text_query)
+        raw_sims, lex_used = self._fuse_lexical(text_query, raw_sims, self.lexical_weight)
 
-        # Step A: Cross-modal similarity against pre-calibrated device embeddings
-        raw_sims = self.methods_registry[method](text_query)
-
-        # Step B: Vectorized 1-Hop Graph Signal Smoothing (O(|E|) CSR SpMV)
+        # Step B: 1-hop graph signal smoothing
         smoothed_sims = np.copy(raw_sims)
         if self.G.number_of_edges() > 0 and smoothing_lambda > 0.0:
             nbr_means = self.smoothing_matrix @ raw_sims
             mask = self.has_neighbors_mask
-            smoothed_sims[mask] = (
-                (1.0 - smoothing_lambda) * raw_sims[mask]
-                + (smoothing_lambda * nbr_means[mask])
-            )
+            smoothed_sims[mask] = (1.0 - smoothing_lambda) * raw_sims[mask] + smoothing_lambda * nbr_means[mask]
 
-        # Step C: Pick Top Entry Seeds & Compute Clinical Z-Score Confidence
+        # Step C: seeds + confidence. A z-score over N nodes can never exceed (N-1)/sqrt(N), so for small
+        # graphs the threshold is unreachable and the warning would always fire; it is suppressed there.
         sorted_indices = np.argsort(smoothed_sims)[::-1]
         seed_nodes = [self.node_list[i] for i in sorted_indices[:top_k_seeds]]
 
@@ -855,9 +731,10 @@ class UNClinicalGraphRAGEngine:
         sim_std = max(float(smoothed_sims.std()), 1e-6)
         top_score = float(smoothed_sims[sorted_indices[0]])
         confidence_z = (top_score - sim_mean) / sim_std
-        low_conf_warning = confidence_z < self.confidence_z_threshold
+        z_attainable = (self.num_nodes - 1) / np.sqrt(self.num_nodes) > self.confidence_z_threshold
+        low_conf_warning = bool(z_attainable and confidence_z < self.confidence_z_threshold)
 
-        # Step D: Fast Vectorized Personalized PageRank (PPR)
+        # Step D: Personalized PageRank rooted on the similarity distribution
         temp_scores = (smoothed_sims - top_score) / max(sim_std, 1e-4)
         exp_scores = np.exp(np.clip(temp_scores, -50.0, 0.0))
         ppr_scores = self._fast_personalized_pagerank(exp_scores, alpha=0.85)
@@ -870,28 +747,21 @@ class UNClinicalGraphRAGEngine:
         ranked_neighbors = sorted(
             candidate_neighbors,
             key=lambda n: (
-                max(
-                    self.G[n][s].get("weight", 0.85)
-                    for s in seed_nodes
-                    if self.G.has_edge(n, s)
-                )
+                max(self.G[n][s].get("weight", 0.85) for s in seed_nodes if self.G.has_edge(n, s))
                 * ppr_scores.get(n, 0.0)
             ),
             reverse=True,
         )
 
         retrieved_subgraph = seed_nodes + ranked_neighbors[:k_neighbors]
-        retrieved_systems = [
-            self.get_node_image_info(n)[2] for n in retrieved_subgraph
-        ]
-        consensus = dict(Counter(retrieved_systems))
+        consensus = dict(Counter(self.get_node_image_info(n)[1] for n in retrieved_subgraph))
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
         if verbose:
             print("=" * 88)
             print(
-                f"UN CLINICAL GRAPH RAG | METHOD: {method} | QUERY: '{text_query}' | "
-                f"Latency: {latency_ms:.2f} ms"
+                f"UN CLINICAL GRAPH RAG | LAYERS: {list(self.text_layers)} | QUERY: '{text_query}' | "
+                f"Latency: {latency_ms:.2f} ms | lexical w={lex_used}"
             )
             print(
                 f"Scores -> Max: {top_score:.4f} | Min: {smoothed_sims.min():.4f} | "
@@ -902,11 +772,13 @@ class UNClinicalGraphRAGEngine:
                     f"⚠️ [CLINICAL WARNING] Low retrieval margin (Z={confidence_z:.2f}σ < "
                     f"{self.confidence_z_threshold}σ). Verify query specificity."
                 )
+            elif not z_attainable:
+                print(f"(Z-score warning disabled: {self.num_nodes} nodes are too few for a {self.confidence_z_threshold}σ margin.)")
             print("-" * 88)
             for node_id in retrieved_subgraph:
                 node_idx = self.node_to_idx[node_id]
                 role = "[SEED]" if node_id in seed_nodes else "[NBR] "
-                img_name, _, body_sys = self.get_node_image_info(node_id)
+                img_name, body_sys = self.get_node_image_info(node_id)
                 print(
                     f"  {role} Node {str(node_id):<4} | System: {body_sys:<18} | "
                     f"Sim: {smoothed_sims[node_idx]:+.4f} | PPR: {ppr_scores[node_id]:.5f} | {img_name}"
@@ -915,7 +787,6 @@ class UNClinicalGraphRAGEngine:
 
         return ClinicalRetrievalResult(
             query=text_query,
-            method=method,
             seed_nodes=seed_nodes,
             retrieved_subgraph=retrieved_subgraph,
             smoothed_sims=smoothed_sims,
@@ -924,70 +795,90 @@ class UNClinicalGraphRAGEngine:
             is_low_confidence_warning=low_conf_warning,
             latency_ms=latency_ms,
             system_consensus=consensus,
+            lexical_weight_used=lex_used,
         )
 
-_CACHED_ENGINE: UNClinicalGraphRAGEngine | None = None
 
 class GraphRAG:
     """
-    High-level Graph RAG Retrieval Service.
+    High-level Graph RAG retrieval service. Queries are encoded exclusively by a text.py
+    `MedicalTextEmbedder`. The engine is built lazily on the first call and rebuilt automatically when the
+    graph, embedder, layers or engine options change.
     """
 
     def __init__(self):
-        """
-        Initializes the GraphRAG service wrapper.
+        self.last_result: ClinicalRetrievalResult | None = None
 
-        Configures the target hardware device (MPS if available, else CPU).
-        """
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    @staticmethod
+    def reset() -> None:
+        """Drops the cached engine (e.g. after editing node attributes in place)."""
+        global _CACHED_ENGINE
+        _CACHED_ENGINE = None
 
     def query_graph_rag_pure(
         self,
         text_query: str,
         G: nx.Graph,
-        text_model: Qwen3VLTextModel,
-        tokenizer: AutoTokenizer,
+        embedder: Any,
         img_embeddings: np.ndarray | None = None,
-        method: str = "1_layer0_boundary_pro",
         top_k_seeds: int = 1,
         k_neighbors: int = K_NEIGHBORS,
         smoothing_lambda: float = 0.40,
         verbose: bool = True,
+        layers: Sequence[int] = (0, 1),
+        layer_weights: Sequence[float] | None = None,
+        fit_queries: Sequence[str] | None = None,
+        force_rebuild: bool = False,
+        **engine_kwargs: Any,
     ) -> tuple[list[Any], list[Any], np.ndarray]:
         """
-        Drop-in entry point for Graph RAG retrieval.
-
-        Automatically initializes and caches `UNClinicalGraphRAGEngine` on the first call,
-        then delegates execution to the cached engine's `query` method.
+        Entry point for Graph RAG retrieval.
 
         Args:
-            text_query (str): Input text prompt or clinical question.
-            G (nx.Graph): Knowledge graph containing image nodes.
-            text_model (Qwen3VLTextModel): Language model backbone.
-            tokenizer (AutoTokenizer): Tokenizer corresponding to the text model.
-            img_embeddings (np.ndarray | None, optional): Precomputed image embeddings fallback.
-                Defaults to None.
-            method (str, optional): Scoring method identifier. Defaults to "1_layer0_boundary_pro".
-            top_k_seeds (int, optional): Number of seed nodes to select. Defaults to 1.
-            k_neighbors (int, optional): Number of neighbor nodes to retrieve. Defaults to 10.
-            smoothing_lambda (float, optional): Neighborhood smoothing factor. Defaults to 0.40.
-            verbose (bool, optional): If True, prints retrieval audit summary. Defaults to True.
+            text_query: input text prompt or clinical question.
+            G: knowledge graph containing image nodes.
+            embedder: text.py `MedicalTextEmbedder` (required).
+            img_embeddings: fallback image embeddings if nodes lack an 'embedding' attribute.
+            top_k_seeds: number of seed nodes.
+            k_neighbors: number of neighbour nodes.
+            smoothing_lambda: neighbourhood smoothing factor.
+            verbose: print the retrieval audit.
+            layers: hidden-state indices used for the query (0 = token embeddings).
+            layer_weights: optional weight per layer (default uniform).
+            fit_queries: optional unlabeled domain queries for calibration (engine build only).
+            force_rebuild: rebuild the cached engine.
+            **engine_kwargs: forwarded to UNClinicalGraphRAGEngine (query_center, drop_stopwords,
+                lexical_weight, center_images, ...).
 
         Returns:
-            tuple[list[Any], list[Any], np.ndarray]:
-                - seed_nodes: List of entry seed node IDs.
-                - retrieved_subgraph: List of all retrieved node IDs (seeds + neighbors).
-                - smoothed_sims: 1D array of graph-smoothed similarity scores.
+            (seed_nodes, retrieved_subgraph, smoothed_sims). The full payload is kept in `self.last_result`.
         """
-
         global _CACHED_ENGINE
+
+        if embedder is None:
+            raise ValueError("`embedder` (a text.py MedicalTextEmbedder) is required.")
+
+        key = (id(G), G.number_of_nodes(), G.number_of_edges(), id(embedder), tuple(layers),
+               tuple(layer_weights) if layer_weights is not None else None,
+               tuple(sorted((k, repr(v)) for k, v in engine_kwargs.items())), tuple(fit_queries or ()))
+        if force_rebuild or _CACHED_ENGINE is None or _CACHED_ENGINE._cache_key != key:
+            _CACHED_ENGINE = UNClinicalGraphRAGEngine(
+                G=G,
+                embedder=embedder,
+                fallback_embs=img_embeddings,
+                fit_queries=fit_queries,
+                layers=tuple(layers),
+                layer_weights=layer_weights,
+                **engine_kwargs,
+            )
+            _CACHED_ENGINE._cache_key = key
 
         res = _CACHED_ENGINE.query(
             text_query=text_query,
-            method=method,
             top_k_seeds=top_k_seeds,
             k_neighbors=k_neighbors,
             smoothing_lambda=smoothing_lambda,
             verbose=verbose,
         )
+        self.last_result = res
         return res.seed_nodes, res.retrieved_subgraph, res.smoothed_sims
