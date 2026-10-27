@@ -50,7 +50,7 @@ SinkMode = Literal["prepend", "drop", "none"]
 class EmbedderConfig:
     model_dir: str = "./saved_qwen3vl_text_embedder"
     pooling: str = "mean_max"               # the only supported pooling (kept for config compatibility)
-    layers: tuple[int, ...] = (4, 8, 12)    # indices into hidden_states (0 = embeddings)
+    layers: tuple[int, ...] = (8, 18, 8)    # indices into hidden_states
     max_text_tokens: int = 2048
     batch_size: int = 4
     max_batch_tokens: int = 8192            # cap on batch_size * padded_len (echo doubles the length)
