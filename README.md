@@ -166,7 +166,7 @@ The embedding engine is optimized for dense clinical question-answering and long
 
 ```python
 import torch
-from metalliger.utils.text import EmbedderConfig, MedicalTextEmbedder, LongContextEmbedder
+from metalliger.utils.text import EmbedderConfig, TextEmbedder, LongContextEmbedder
 
 # 1. Initialize configuration with production parameters
 config = EmbedderConfig(
@@ -206,7 +206,7 @@ config = EmbedderConfig(
 
 ```python
 # 2. Standard Document Retrieval
-embedder = MedicalTextEmbedder(config)
+embedder = TextEmbedder(config)
 
 corpus = [
     "Acute coronary syndrome presents with substernal chest pain radiating to the left arm and jaw, diaphoresis, and ST elevation.",
@@ -281,11 +281,11 @@ print(f"Average Encoding Latency: {sum(latencies)/len(latencies):.2f} ms/image")
 Combine `metalliger.utils.text` and `metalliger.utils.vison` into a unified multimodal Graph-RAG system that navigates radiological scans via natural language clinical queries:
 
 ```python
-from metalliger.metalliger.utils.text import MedicalTextEmbedder, EmbedderConfig
+from metalliger.metalliger.utils.text import TextEmbedder, EmbedderConfig
 
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
-embedder = MedicalTextEmbedder(EmbedderConfig(model_dir="madrisight/madrimed1.2-vision-embed", dtype=torch.float32))
+embedder = TextEmbedder(EmbedderConfig(model_dir="madrisight/madrimed1.2-vision-embed", dtype=torch.float32))
 
 rag_service = GraphRAG()
 seed_nodes, retrieved_subgraph, smoothed_sims = rag_service.query_graph_rag_pure(
