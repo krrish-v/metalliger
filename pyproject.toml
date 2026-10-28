@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metalliger"
+version = "0.5.0"
+description = "Fused Metal kernels for PyTorch MPS training & inference on Apple Silicon"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "MetalLiger Contributors" }
+]
+keywords = [
+    "apple-silicon",
+    "metal",
+    "mps",
+    "pytorch",
+    "llm",
+    "vlm",
+    "inference",
+    "flash-attention",
+    "qwen",
+    "qwen3-vl",
+    "operator-fusion"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "transformers>=4.40.0",
+    "qwen-vl-utils>=0.0.8",
+    "protobuf>=4.25.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+graph = [
+    "networkx>=3.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+]
+all = [
+    "networkx>=3.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "twine>=4.0.0",
+    "build>=0.10.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mpsops/metalliger"
+Repository = "https://github.com/mpsops/metalliger"
+Issues = "https://github.com/mpsops/metalliger/issues"
+
+[tool.setuptools.packages.find]
+where = [".", "metalliger"]
+include = ["metalliger*"]
+exclude = ["examples*", "tests*"]
