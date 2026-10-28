@@ -98,6 +98,11 @@ git clone https://github.com/mpsops/mps-flash-attention && pip install -e mps-fl
 ```
 
 ### 3. Step-by-Step Installation
+
+```bash
+pip install metalliger
+```
+or
 ```bash
 pip install git+https://github.com/krrish-v/metalliger.git
 ```
