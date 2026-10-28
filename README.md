@@ -273,7 +273,7 @@ print(f"Average Encoding Latency: {sum(latencies)/len(latencies):.2f} ms/image")
 Combine `metalliger.utils.text` and `metalliger.utils.vison` into a unified multimodal Graph-RAG system that navigates radiological scans via natural language clinical queries:
 
 ```python
-from metalliger.metalliger.utils.text import TextEmbedder, EmbedderConfig
+from metalliger.utils.text import TextEmbedder, EmbedderConfig
 
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
