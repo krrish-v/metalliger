@@ -514,7 +514,7 @@ def sinkhorn_scores(s: torch.Tensor, tau: float, iters: int = 1) -> torch.Tensor
 # --------------------------------------------------------------------------- #
 # Embedder / retriever
 # --------------------------------------------------------------------------- #
-class MedicalTextEmbedder:
+class TextEmbedder:
     # config fields restored by load_index so a saved index reproduces the tuned pipeline
     _TUNED = (
         "hybrid_weight", "prf_k", "prf_beta", "hub_gamma", "norm_tau", "norm_iters",
@@ -1112,9 +1112,9 @@ class MedicalTextEmbedder:
 # --------------------------------------------------------------------------- #
 # Long Context Extension
 # --------------------------------------------------------------------------- #
-class LongContextEmbedder(MedicalTextEmbedder):
+class LongContextEmbedder(TextEmbedder):
     """
-    Extension of MedicalTextEmbedder that handles long documents by chunking them 
+    Extension of TextEmbedder that handles long documents by chunking them 
     and using MaxSim aggregation during search and evaluation.
     """
     def __init__(self, *args, chunk_size: int = 512, chunk_overlap: int = 64, **kwargs):
@@ -1197,4 +1197,3 @@ class LongContextEmbedder(MedicalTextEmbedder):
                 doc_scores[:, doc_idx] = chunk_scores[:, chunk_indices].max(dim=1).values
                 
         return metrics_from_scores(doc_scores, relevant, ks)
-
