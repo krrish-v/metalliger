@@ -9,7 +9,7 @@ for vision-language tasks using Qwen3-VL models. It includes:
   - Sparse graph operator precomputation (row-stochastic smoothing matrix and PageRank transition).
   - Vectorized Personalized PageRank (PPR) for clinical subgraph retrieval.
 
-QUERY ENCODING is delegated entirely to a text.py `MedicalTextEmbedder` passed as `embedder=`:
+QUERY ENCODING is delegated entirely to a text.py `TextEmbedder` passed as `embedder=`:
   - the embedder supplies the model, tokenizer, token conditioning (z-score, outlier masking, token norm)
     and mean pooling; `layers=` picks which hidden states form the query (0 = token embeddings)
   - only the mean-pooled half of its output is used (image vectors are mean-pooled)
@@ -420,7 +420,7 @@ class ClinicalRetrievalResult:
 
 class UNClinicalGraphRAGEngine:
     """
-    Cross-modal Graph RAG engine whose query side is a text.py `MedicalTextEmbedder`.
+    Cross-modal Graph RAG engine whose query side is a text.py `TextEmbedder`.
 
     Pre-computes and caches:
       - (optionally mean-centred) L2-normalised image embeddings on the embedder's device,
@@ -444,11 +444,12 @@ class UNClinicalGraphRAGEngine:
         lexical_weight: float = 0.3,
         center_images: bool | None = None,
         min_nodes_for_centering: int = 8,
+        **kwargs: Any,
     ):
         """
         Args:
             G: knowledge graph (nodes carry 'embedding' and optionally 'text').
-            embedder: a text.py `MedicalTextEmbedder` (provides model, tokenizer and token conditioning).
+            embedder: a text.py `TextEmbedder` (provides model, tokenizer and token conditioning).
             device: compute device for scoring (default: the embedder model's device).
             fallback_embs: used when nodes lack an 'embedding' attribute.
             confidence_z_threshold: z-score under which a low-confidence warning is raised.
@@ -467,8 +468,31 @@ class UNClinicalGraphRAGEngine:
         """
         if G.number_of_nodes() == 0:
             raise ValueError("Graph G contains no nodes.")
+
+        # Handle legacy method mapping if provided in kwargs
+        method = kwargs.pop("method", None)
+        if method == "fast_layer0_static":
+            layers = (0,)
+            layer_weights = (1.0,)
+        elif method == "hybrid_blended_context":
+            layers = (0, 1)
+            layer_weights = (0.8, 0.2)
+
+        # Handle legacy text_model + tokenizer wrapping
+        if embedder is not None and not hasattr(embedder, "encode_raw"):
+            tok = kwargs.pop("tokenizer", None) or getattr(embedder, "tokenizer", None)
+            if tok is not None:
+                from metalliger.utils.text import TextEmbedder
+                embedder = TextEmbedder(model=embedder, tokenizer=tok)
+
         if embedder is None:
-            raise ValueError("`embedder` (a text.py MedicalTextEmbedder) is required.")
+            text_model = kwargs.pop("text_model", None)
+            tok = kwargs.pop("tokenizer", None)
+            if text_model is not None and tok is not None:
+                from metalliger.utils.text import TextEmbedder
+                embedder = TextEmbedder(model=text_model, tokenizer=tok)
+            else:
+                raise ValueError("`embedder` (a text.py TextEmbedder) is required.")
 
         self.G = G
         self.embedder = embedder
@@ -581,7 +605,7 @@ class UNClinicalGraphRAGEngine:
         return img_name, str(label)
 
     # ------------------------------------------------------------------ #
-    # Query encoding through the text.py MedicalTextEmbedder
+    # Query encoding through the text.py TextEmbedder
     # ------------------------------------------------------------------ #
     def _prep_query(self, query: str) -> str:
         """NFKC-normalise and (optionally) drop stopwords, keeping the query if nothing else is left."""
@@ -802,7 +826,7 @@ class UNClinicalGraphRAGEngine:
 class GraphRAG:
     """
     High-level Graph RAG retrieval service. Queries are encoded exclusively by a text.py
-    `MedicalTextEmbedder`. The engine is built lazily on the first call and rebuilt automatically when the
+    `TextEmbedder`. The engine is built lazily on the first call and rebuilt automatically when the
     graph, embedder, layers or engine options change.
     """
 
@@ -819,7 +843,7 @@ class GraphRAG:
         self,
         text_query: str,
         G: nx.Graph,
-        embedder: Any,
+        embedder: Any = None,
         img_embeddings: np.ndarray | None = None,
         top_k_seeds: int = 1,
         k_neighbors: int = K_NEIGHBORS,
@@ -837,7 +861,7 @@ class GraphRAG:
         Args:
             text_query: input text prompt or clinical question.
             G: knowledge graph containing image nodes.
-            embedder: text.py `MedicalTextEmbedder` (required).
+            embedder: text.py `TextEmbedder` (or `(text_model, tokenizer)`).
             img_embeddings: fallback image embeddings if nodes lack an 'embedding' attribute.
             top_k_seeds: number of seed nodes.
             k_neighbors: number of neighbour nodes.
@@ -848,15 +872,40 @@ class GraphRAG:
             fit_queries: optional unlabeled domain queries for calibration (engine build only).
             force_rebuild: rebuild the cached engine.
             **engine_kwargs: forwarded to UNClinicalGraphRAGEngine (query_center, drop_stopwords,
-                lexical_weight, center_images, ...).
+                lexical_weight, center_images, method, text_model, tokenizer, ...).
 
         Returns:
             (seed_nodes, retrieved_subgraph, smoothed_sims). The full payload is kept in `self.last_result`.
         """
         global _CACHED_ENGINE
 
+        # Backwards compatibility: handle method mapping
+        method = engine_kwargs.pop("method", None)
+        if method == "fast_layer0_static":
+            layers = (0,)
+            layer_weights = (1.0,)
+        elif method == "hybrid_blended_context":
+            layers = (0, 1)
+            layer_weights = (0.8, 0.2)
+
+        # Backwards compatibility: handle legacy positional or keyword text_model + tokenizer
         if embedder is None:
-            raise ValueError("`embedder` (a text.py MedicalTextEmbedder) is required.")
+            text_model = engine_kwargs.pop("text_model", None)
+            tokenizer = engine_kwargs.pop("tokenizer", None)
+            if text_model is not None and tokenizer is not None:
+                from metalliger.utils.text import TextEmbedder
+                embedder = TextEmbedder(model=text_model, tokenizer=tokenizer)
+            else:
+                raise ValueError("`embedder` (a text.py TextEmbedder) or `(text_model, tokenizer)` is required.")
+        elif not hasattr(embedder, "encode_raw"):
+            if hasattr(img_embeddings, "encode") or hasattr(img_embeddings, "decode"):
+                from metalliger.utils.text import TextEmbedder
+                real_tokenizer = img_embeddings
+                embedder = TextEmbedder(model=embedder, tokenizer=real_tokenizer)
+                img_embeddings = engine_kwargs.pop("img_embeddings", None)
+                if img_embeddings is None and not isinstance(top_k_seeds, int):
+                    img_embeddings = top_k_seeds
+                    top_k_seeds = 1
 
         key = (id(G), G.number_of_nodes(), G.number_of_edges(), id(embedder), tuple(layers),
                tuple(layer_weights) if layer_weights is not None else None,
